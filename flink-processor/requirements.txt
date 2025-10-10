@@ -1,0 +1,8 @@
+kafka-python==2.0.2
+pandas==2.1.4
+pyarrow==14.0.1
+boto3==1.34.21
+requests==2.31.0
+pyiceberg[s3fs,sql-sqlite]==0.5.1
+pydantic==2.5.0
+sqlalchemy==2.0.23
