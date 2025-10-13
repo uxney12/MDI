@@ -104,30 +104,42 @@ services:
       - data-pipeline
 
   # ========================================
-  # KAFKA PRODUCER (Postgres -> Kafka)
+  # UNIFIED KAFKA PRODUCER (PostgreSQL + MS SQL)
   # ========================================
   kafka-producer:
     build:
       context: ./kafka-producer
-    container_name: kafka_producer
+    container_name: kafka_producer_unified
     depends_on:
       kafka:
         condition: service_healthy
     environment:
+      # Kafka config
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      
+      # Enable/Disable sources
+      ENABLE_POSTGRES: "true"
+      ENABLE_MSSQL: "true"
+      
       # PostgreSQL config
-      PG_HOST: host.docker.internal  # Truy cập Postgres trên host machine
+      PG_HOST: host.docker.internal
       PG_PORT: 5432
       PG_DATABASE: MDI
       PG_USER: postgres
       PG_PASSWORD: 12345
       
-      # Kafka config
-      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      # MS SQL Server config
+      MSSQL_HOST: host.docker.internal
+      MSSQL_PORT: 1433
+      MSSQL_DATABASE: Mpass
+      MSSQL_USER: mssql
+      MSSQL_PASSWORD: 12345
+      MSSQL_POLL_INTERVAL: 5
     networks:
       - data-pipeline
     restart: unless-stopped
     extra_hosts:
-      - "host.docker.internal:host-gateway"  # Cho phép truy cập host machine
+      - "host.docker.internal:host-gateway"
 
   # ========================================
   # FLINK PROCESSOR (Kafka -> Iceberg)

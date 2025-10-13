@@ -4,10 +4,12 @@ import time
 import json
 import logging
 import select
-import traceback
+import threading
+from typing import Optional
 
 import psycopg2
 import psycopg2.extensions
+import pymssql
 from kafka import KafkaProducer
 from kafka.errors import KafkaError
 
@@ -17,33 +19,63 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class PostgresKafkaProducer:
+
+class UnifiedKafkaProducer:
     def __init__(self):
-        # --- cấu hình PostgreSQL ---
+        # --- Cấu hình Kafka ---
+        self.kafka_servers = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
+        self.producer = None
+        
+        # --- Cấu hình PostgreSQL ---
+        self.enable_postgres = os.getenv('ENABLE_POSTGRES', 'true').lower() == 'true'
         self.pg_config = {
             'host': os.getenv('PG_HOST', 'host.docker.internal'),
             'port': int(os.getenv('PG_PORT', 5432)),
             'database': os.getenv('PG_DATABASE', 'MDI'),
             'user': os.getenv('PG_USER', 'postgres'),
             'password': os.getenv('PG_PASSWORD', '12345'),
-            # Kết nối nhanh / keepalive (thông số libpq)
-            'connect_timeout': int(os.getenv('PG_CONNECT_TIMEOUT', 10)),
+            'connect_timeout': 10,
             'keepalives': 1,
-            'keepalives_idle': int(os.getenv('PG_KEEPALIVES_IDLE', 30)),
-            'keepalives_interval': int(os.getenv('PG_KEEPALIVES_INTERVAL', 10)),
-            'keepalives_count': int(os.getenv('PG_KEEPALIVES_COUNT', 5)),
+            'keepalives_idle': 30,
+            'keepalives_interval': 10,
+            'keepalives_count': 5,
         }
-
-        # --- cấu hình Kafka ---
-        self.kafka_servers = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
-        self.producer = None
-        self.connection = None
-
-        logger.info("=== Kafka Producer Configuration ===")
-        logger.info(f"PostgreSQL Host: {self.pg_config['host']}:{self.pg_config['port']}/{self.pg_config['database']}")
+        self.pg_connection = None
+        self.pg_table = 'mcc'
+        self.pg_topic = 'postgres-mcc-changes'
+        
+        # --- Cấu hình MS SQL Server ---
+        self.enable_mssql = os.getenv('ENABLE_MSSQL', 'true').lower() == 'true'
+        self.mssql_config = {
+            'host': os.getenv('MSSQL_HOST', 'host.docker.internal'),
+            'port': int(os.getenv('MSSQL_PORT', 1433)),
+            'database': os.getenv('MSSQL_DATABASE', 'Mpass'),
+            'user': os.getenv('MSSQL_USER', 'mssql'),
+            'password': os.getenv('MSSQL_PASSWORD', '12345'),
+            'timeout': 30,
+            'login_timeout': 10,
+        }
+        self.mssql_connection = None
+        self.mssql_table = 'mpass'
+        self.mssql_topic = 'mssql-mpass-changes'
+        self.mssql_poll_interval = int(os.getenv('MSSQL_POLL_INTERVAL', 5))
+        
+        # Message counter
+        self.message_count = 0
+        self.lock = threading.Lock()
+        
+        logger.info("=== Unified Kafka Producer Configuration ===")
         logger.info(f"Kafka Servers: {self.kafka_servers}")
+        if self.enable_postgres:
+            logger.info(f"PostgreSQL: ENABLED - {self.pg_config['database']}.{self.pg_table}")
+        else:
+            logger.info("PostgreSQL: DISABLED")
+        if self.enable_mssql:
+            logger.info(f"MS SQL Server: ENABLED - {self.mssql_config['database']}.{self.mssql_table}")
+        else:
+            logger.info("MS SQL Server: DISABLED")
 
-    # ---------------------- Kết nối Kafka (với retry) ----------------------
+    # ===================== KAFKA ======================
     def connect_kafka(self, max_retries=5):
         if self.producer:
             return
@@ -65,222 +97,296 @@ class PostgresKafkaProducer:
                 logger.warning(f"Kafka connection failed (attempt {attempt}/{max_retries}): {e}")
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 30)
-        raise Exception("Failed to connect to Kafka after multiple retries")
+        raise Exception("Failed to connect to Kafka")
 
-    # ---------------------- Kết nối PostgreSQL (với keepalives + retry) ----------------------
+    # ===================== POSTGRESQL ======================
     def connect_postgres(self, max_retries=30):
+        if not self.enable_postgres:
+            return
         attempt = 0
         backoff = 1
-        last_exc = None
         while attempt < max_retries:
             try:
-                conn_kwargs = self.pg_config.copy()
-                # psycopg2 sẽ chấp nhận các keyword trên (libpq options)
-                self.connection = psycopg2.connect(**conn_kwargs)
-                # đảm bảo autocommit để LISTEN/NOTIFY hoạt động ổn định
-                self.connection.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
-                logger.info(f"✓ Connected to PostgreSQL: {self.pg_config['host']}:{self.pg_config['port']}/{self.pg_config['database']}")
-                # Test đơn giản
-                cur = self.connection.cursor()
-                cur.execute("SELECT version();")
-                ver = cur.fetchone()
-                logger.info(f"PostgreSQL version: {ver[0] if ver else 'unknown'}")
-                cur.close()
+                self.pg_connection = psycopg2.connect(**self.pg_config)
+                self.pg_connection.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+                logger.info(f"✓ Connected to PostgreSQL: {self.pg_config['database']}")
                 return
             except Exception as e:
                 attempt += 1
-                last_exc = e
                 logger.warning(f"PostgreSQL connection failed (attempt {attempt}/{max_retries}): {e}")
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 30)
-        raise Exception("Failed to connect to PostgreSQL after multiple retries") from last_exc
+        raise Exception("Failed to connect to PostgreSQL")
 
-    def setup_listen_channels(self, cursor):
-        # Hủy listen cũ rồi đăng ký lại
-        try:
-            cursor.execute("UNLISTEN *;")
-        except Exception:
-            pass
-        cursor.execute("LISTEN mcc_changes;")
-        cursor.execute("LISTEN mpass_changes;")
-        logger.info("LISTEN registered: mcc_changes, mpass_changes")
-
-    # ---------------------- Nạp dữ liệu lần đầu (giữ nguyên logic) ----------------------
-    def initial_load(self):
-        if not self.connection:
-            logger.warning("initial_load: no DB connection")
+    def postgres_initial_load(self):
+        if not self.enable_postgres or not self.pg_connection:
             return
         try:
-            cursor = self.connection.cursor()
-            tables = [
-                ("mcc", "mcc-changes"),
-                ("mpass", "mpass-changes")
-            ]
-            for table, topic in tables:
-                logger.info(f"🚀 Starting initial load for table: {table}")
-                cursor.execute(f"SELECT * FROM {table};")
-                columns = [desc[0] for desc in cursor.description]
-                rows = cursor.fetchall()
-                total = len(rows)
-                logger.info(f"Found {total} rows in table '{table}'")
-                for idx, row in enumerate(rows, start=1):
-                    data = dict(zip(columns, row))
-                    payload = {
-                        "operation": "INITIAL_LOAD",
-                        "table": table.upper(),
-                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                        "data": data
-                    }
-                    # đảm bảo Kafka producer sẵn sàng
-                    self.connect_kafka()
-                    self.producer.send(topic, value=payload)
-                    if idx % 500 == 0:
-                        logger.info(f"Sent {idx}/{total} rows for {table}")
-                        self.producer.flush()
-                self.producer.flush()
-                logger.info(f"✓ Completed initial load for table '{table}' ({total} rows)")
+            cursor = self.pg_connection.cursor()
+            logger.info(f"🚀 Starting initial load: PostgreSQL.{self.pg_table}")
+            cursor.execute(f"SELECT * FROM {self.pg_table};")
+            columns = [desc[0] for desc in cursor.description]
+            rows = cursor.fetchall()
+            total = len(rows)
+            logger.info(f"Found {total} rows in {self.pg_table}")
+            
+            for idx, row in enumerate(rows, start=1):
+                payload = {
+                    "operation": "INITIAL_LOAD",
+                    "table": self.pg_table,
+                    "database": self.pg_config['database'],
+                    "source": "postgresql",
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "data": dict(zip(columns, row))
+                }
+                self.producer.send(self.pg_topic, value=payload)
+                if idx % 500 == 0:
+                    logger.info(f"PostgreSQL: Sent {idx}/{total} rows")
+                    self.producer.flush()
+            
+            self.producer.flush()
+            logger.info(f"✓ PostgreSQL initial load completed ({total} rows)")
             cursor.close()
         except Exception as e:
-            logger.exception("❌ Error during initial load")
+            logger.exception("❌ PostgreSQL initial load error")
 
-    # ---------------------- Xử lý notification riêng ----------------------
-    def handle_notification(self, notify, message_count):
-        try:
-            payload = json.loads(notify.payload)
-        except json.JSONDecodeError:
-            logger.error("Notification payload is not valid JSON: %s", notify.payload)
+    def postgres_listen_loop(self):
+        if not self.enable_postgres:
             return
-
-        table_name = payload.get('table')
-        operation = payload.get('operation')
-
-        topic = {
-            'MCC': 'mcc-changes',
-            'MPASS': 'mpass-changes'
-        }.get(table_name)
-
-        if not topic:
-            logger.warning(f"Unknown table in payload: {table_name} | raw: {notify.payload}")
-            return
-
-        # ensure kafka
-        try:
-            self.connect_kafka()
-        except Exception as e:
-            logger.error("Cannot connect to Kafka, skipping message: %s", e)
-            return
-
-        try:
-            future = self.producer.send(topic, value=payload)
-            result = future.get(timeout=10)
-            logger.info(
-                f"[{message_count}] ✓ Sent to Kafka | Table: {table_name:6} | Operation: {operation:10} | "
-                f"Topic: {topic:15} | Partition: {result.partition} | Offset: {result.offset}"
-            )
-        except KafkaError as e:
-            logger.error(f"Kafka send error: {e}")
-        except Exception:
-            logger.exception("Unexpected error while sending to Kafka")
-
-    # ---------------------- Vòng lắng nghe chính (tự động reconnect) ----------------------
-    def listen_and_produce(self):
-        message_count = 0
-        postgres_backoff = 1
-
+        
+        backoff = 1
+        logger.info(f"Starting PostgreSQL listener thread for {self.pg_table}")
+        
         while True:
             try:
-                # đảm bảo Postgres kết nối
-                if not self.connection or getattr(self.connection, "closed", 1) != 0:
-                    logger.info("DB connection missing or closed -> connecting...")
+                if not self.pg_connection or getattr(self.pg_connection, "closed", 1) != 0:
+                    logger.info("PostgreSQL: Reconnecting...")
                     self.connect_postgres()
-
-                cursor = self.connection.cursor()
-                self.setup_listen_channels(cursor)
-
-                logger.info("=" * 60)
-                logger.info("✓ Listening for PostgreSQL notifications")
-                logger.info("  Channels: mcc_changes, mpass_changes")
-                logger.info("  Waiting for database changes...")
-                logger.info("=" * 60)
-
-                # Sử dụng select để chờ socket - hiệu quả hơn polling liên tục
+                
+                cursor = self.pg_connection.cursor()
+                cursor.execute("UNLISTEN *;")
+                cursor.execute("LISTEN mcc_changes;")
+                logger.info("✓ PostgreSQL LISTEN registered: mcc_changes")
+                
                 while True:
-                    # nếu socket có activity trong 5s, trả về list non-empty
-                    ready = select.select([self.connection], [], [], 5)
+                    ready = select.select([self.pg_connection], [], [], 5)
                     if ready[0]:
-                        # có dữ liệu: poll và lấy notifications
-                        self.connection.poll()
-                        while self.connection.notifies:
-                            notify = self.connection.notifies.pop(0)
-                            message_count += 1
+                        self.pg_connection.poll()
+                        while self.pg_connection.notifies:
+                            notify = self.pg_connection.notifies.pop(0)
                             try:
-                                self.handle_notification(notify, message_count)
-                            except Exception:
-                                logger.exception("Error processing notification")
-                    else:
-                        # timeout: không có notify; vòng lặp tiếp tục (đã có keepalive ở TCP level)
-                        pass
-
+                                payload = json.loads(notify.payload)
+                                self.producer.send(self.pg_topic, value=payload)
+                                
+                                with self.lock:
+                                    self.message_count += 1
+                                    count = self.message_count
+                                
+                                operation = payload.get('operation', 'UNKNOWN')
+                                logger.info(
+                                    f"[{count}] ✓ PostgreSQL | "
+                                    f"Table: {self.pg_table} | Op: {operation:10} | "
+                                    f"Topic: {self.pg_topic}"
+                                )
+                            except Exception as e:
+                                logger.exception("Error processing PostgreSQL notification")
+                
+                backoff = 1
+                
             except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
-                # lỗi kết nối DB: cố reconnect
-                logger.error(f"Postgres connection error: {e}")
-                logger.info("Attempting to reconnect to PostgreSQL in %s seconds...", postgres_backoff)
-                self._close_connection()
-                time.sleep(postgres_backoff)
-                postgres_backoff = min(postgres_backoff * 2, 30)
-                continue
-            except KeyboardInterrupt:
-                logger.info("Interrupted by user")
-                break
+                logger.error(f"PostgreSQL connection error: {e}")
+                self._close_postgres()
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30)
             except Exception as e:
-                logger.exception("Unexpected error in listen loop: %s", e)
-                # giữ kết nối / thử lại
+                logger.exception("Unexpected error in PostgreSQL loop")
                 time.sleep(5)
 
-    # ---------------------- Helpers ----------------------
-    def _close_connection(self):
+    def _close_postgres(self):
         try:
-            if self.connection:
-                try:
-                    self.connection.close()
-                except Exception:
-                    pass
+            if self.pg_connection:
+                self.pg_connection.close()
+        except:
+            pass
         finally:
-            self.connection = None
+            self.pg_connection = None
 
+    # ===================== MS SQL SERVER ======================
+    def connect_mssql(self, max_retries=30):
+        if not self.enable_mssql:
+            return
+        attempt = 0
+        backoff = 1
+        while attempt < max_retries:
+            try:
+                self.mssql_connection = pymssql.connect(
+                    server=self.mssql_config['host'],
+                    port=self.mssql_config['port'],
+                    user=self.mssql_config['user'],
+                    password=self.mssql_config['password'],
+                    database=self.mssql_config['database'],
+                    timeout=self.mssql_config['timeout'],
+                    login_timeout=self.mssql_config['login_timeout']
+                )
+                logger.info(f"✓ Connected to MS SQL: {self.mssql_config['database']}")
+                return
+            except Exception as e:
+                attempt += 1
+                logger.warning(f"MS SQL connection failed (attempt {attempt}/{max_retries}): {e}")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+        raise Exception("Failed to connect to MS SQL Server")
+
+    def mssql_initial_load(self):
+        if not self.enable_mssql or not self.mssql_connection:
+            return
+        try:
+            cursor = self.mssql_connection.cursor(as_dict=True)
+            logger.info(f"🚀 Starting initial load: MSSQL.{self.mssql_table}")
+            cursor.execute(f"SELECT * FROM {self.mssql_table};")
+            rows = cursor.fetchall()
+            total = len(rows)
+            logger.info(f"Found {total} rows in {self.mssql_table}")
+            
+            for idx, row in enumerate(rows, start=1):
+                payload = {
+                    "operation": "INITIAL_LOAD",
+                    "table": self.mssql_table,
+                    "database": self.mssql_config['database'],
+                    "source": "mssql",
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "data": row
+                }
+                self.producer.send(self.mssql_topic, value=payload)
+                if idx % 500 == 0:
+                    logger.info(f"MS SQL: Sent {idx}/{total} rows")
+                    self.producer.flush()
+            
+            self.producer.flush()
+            logger.info(f"✓ MS SQL initial load completed ({total} rows)")
+            cursor.close()
+        except Exception as e:
+            logger.exception("❌ MS SQL initial load error")
+
+    def mssql_poll_loop(self):
+        if not self.enable_mssql:
+            return
+        
+        backoff = 1
+        last_processed_id = 0
+        logger.info(f"Starting MS SQL poller thread for {self.mssql_table} (interval: {self.mssql_poll_interval}s)")
+        
+        while True:
+            try:
+                if not self.mssql_connection:
+                    logger.info("MS SQL: Reconnecting...")
+                    self.connect_mssql()
+
+                cursor = self.mssql_connection.cursor(as_dict=True)
+                cursor.execute(f"""
+                    SELECT TOP 100 id, operation, changed_at, data
+                    FROM mpass_audit_log
+                    WHERE id > {last_processed_id}
+                    ORDER BY id ASC
+                """)
+                audit_rows = cursor.fetchall()
+                
+                for row in audit_rows:
+                    try:
+                        payload = json.loads(row['data'])
+                        self.producer.send(self.mssql_topic, value=payload)
+                        
+                        with self.lock:
+                            self.message_count += 1
+                            count = self.message_count
+                        
+                        logger.info(
+                            f"[{count}] ✓ MS SQL (audit) | "
+                            f"Op: {row['operation']:10} | Topic: {self.mssql_topic}"
+                        )
+                        last_processed_id = row['id']
+                    except Exception as e:
+                        logger.exception("Error processing MS SQL audit log")
+                
+                cursor.close()
+                backoff = 1
+                time.sleep(self.mssql_poll_interval)
+                
+            except pymssql.Error as e:
+                logger.error(f"MS SQL connection error: {e}")
+                self._close_mssql()
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+            except Exception as e:
+                logger.exception("Unexpected error in MS SQL loop")
+                time.sleep(5)
+
+
+    def _close_mssql(self):
+        try:
+            if self.mssql_connection:
+                self.mssql_connection.close()
+        except:
+            pass
+        finally:
+            self.mssql_connection = None
+
+    # ===================== MAIN ======================
     def shutdown(self):
-        logger.info("Shutting down producer...")
+        logger.info("Shutting down...")
         try:
             if self.producer:
                 self.producer.flush()
                 self.producer.close()
-                logger.info("Kafka producer closed")
-        except Exception:
-            logger.exception("Error closing Kafka producer")
-        try:
-            if self.connection:
-                self.connection.close()
-                logger.info("PostgreSQL connection closed")
-        except Exception:
-            logger.exception("Error closing DB connection")
+        except:
+            pass
+        self._close_postgres()
+        self._close_mssql()
+        logger.info("Shutdown complete")
 
-    # ---------------------- Start toàn bộ ----------------------
     def start(self):
         try:
-            logger.info("🚀 Starting PostgresKafkaProducer...")
+            logger.info("🚀 Starting Unified Kafka Producer...")
+            
             self.connect_kafka()
-            self.connect_postgres()
-            self.initial_load()
-            self.listen_and_produce()
+            
+            if self.enable_postgres:
+                self.connect_postgres()
+                self.postgres_initial_load()
+            
+            if self.enable_mssql:
+                self.connect_mssql()
+                self.mssql_initial_load()
+            
+            threads = []
+            
+            if self.enable_postgres:
+                pg_thread = threading.Thread(target=self.postgres_listen_loop, daemon=True)
+                pg_thread.start()
+                threads.append(pg_thread)
+            
+            if self.enable_mssql:
+                mssql_thread = threading.Thread(target=self.mssql_poll_loop, daemon=True)
+                mssql_thread.start()
+                threads.append(mssql_thread)
+            
+            logger.info("=" * 60)
+            logger.info("✓ All listeners started")
+            logger.info("  Press Ctrl+C to stop")
+            logger.info("=" * 60)
+            
+            for thread in threads:
+                thread.join()
+            
         except KeyboardInterrupt:
-            logger.info("Shutting down (keyboard interrupt)")
+            logger.info("Interrupted by user")
         except Exception:
-            logger.exception("Fatal error in producer")
+            logger.exception("Fatal error")
             raise
         finally:
             self.shutdown()
 
 
 if __name__ == "__main__":
-    producer = PostgresKafkaProducer()
+    producer = UnifiedKafkaProducer()
     producer.start()

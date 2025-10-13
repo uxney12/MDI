@@ -37,29 +37,26 @@ class FlinkProcessor:
         self.s3_endpoint = os.getenv("S3_ENDPOINT", "http://minio:9000")
         self.s3_access_key = os.getenv("S3_ACCESS_KEY", "admin")
         self.s3_secret_key = os.getenv("S3_SECRET_KEY", "password123")
-        self.data_bucket = os.getenv("DATA_BUCKET", "bangke-data")
-        
-        # Single parquet file path
-        self.parquet_file_key = "bangke/bangke_data.parquet"
+        self.data_bucket = os.getenv("DATA_BUCKET", "iceberg-data")
 
         self.consumer = None
         self.record_count = 0
+        
+        # Cache để lưu schema của từng table
+        self.schema_cache = {}
 
         logger.info("=== Flink Processor Configuration ===")
         logger.info(f"Kafka: {self.kafka_servers}")
         logger.info(f"Flink JobManager: {self.flink_host}:{self.flink_port}")
         logger.info(f"MinIO Endpoint: {self.s3_endpoint}")
         logger.info(f"Data Bucket: {self.data_bucket}")
-        logger.info(f"Parquet File: s3://{self.data_bucket}/{self.parquet_file_key}")
+        logger.info("Auto-detecting schemas from incoming data...")
 
         # Setup S3 Client
         self.s3_client = self.setup_s3_client()
         
         # Create MinIO bucket if not exists
         self.ensure_bucket_exists()
-        
-        # Initialize data schema
-        self.arrow_schema = self.get_arrow_schema()
 
     # =========================
     # Setup S3 Client
@@ -88,12 +85,10 @@ class FlinkProcessor:
     def ensure_bucket_exists(self):
         """Create MinIO bucket if it doesn't exist."""
         try:
-            # Check if bucket exists
             try:
                 self.s3_client.head_bucket(Bucket=self.data_bucket)
                 logger.info(f"✓ Bucket '{self.data_bucket}' already exists")
             except ClientError:
-                # Create bucket if not exists
                 self.s3_client.create_bucket(Bucket=self.data_bucket)
                 logger.info(f"✓ Created bucket '{self.data_bucket}'")
                 
@@ -102,46 +97,11 @@ class FlinkProcessor:
             raise
 
     # =========================
-    # Define Arrow Schema
+    # Get Parquet Path for Table
     # =========================
-    def get_arrow_schema(self):
-        """Define PyArrow schema for the parquet file."""
-        return pa.schema([
-            ('id', pa.string()),  # Unique identifier for each record
-            ('source_table', pa.string()),
-            ('operation', pa.string()),
-            ('processed_at', pa.string()),
-            ('stt', pa.string()),
-            ('ma_kh', pa.string()),
-            ('ma_hd', pa.string()),
-            ('nv_quan_ly', pa.string()),
-            ('ma_nhan_vien', pa.string()),
-            ('ma_lai_xe', pa.string()),
-            ('id_cuoc_xe', pa.string()),
-            ('so_the', pa.string()),
-            ('ten_tren_the', pa.string()),
-            ('san_pham', pa.string()),
-            ('so_tien', pa.string()),
-            ('so_giao_dich', pa.string()),
-            ('ma_giao_dich', pa.string()),
-            ('ma_tai', pa.string()),
-            ('ngay_giao_dich', pa.string()),
-            ('thoi_diem_giao_dich', pa.string()),
-            ('ngay_di_thuc_te', pa.string()),
-            ('ngay_hieu_luc', pa.string()),
-            ('bien_so_xe', pa.string()),
-            ('diem_don', pa.string()),
-            ('diem_tra', pa.string()),
-            ('don_vi_phat_sinh', pa.string()),
-            ('ma_dv_phat_sinh', pa.string()),
-            ('ten_dv_phat_sinh', pa.string()),
-            ('ma_dv_quan_ly_kh', pa.string()),
-            ('ten_dv_quan_ly_kh', pa.string()),
-            ('trang_thai_giao_dich', pa.string()),
-            ('loai_giao_dich', pa.string()),
-            ('ghi_chu', pa.string()),
-            ('is_deleted', pa.bool_()),  # Soft delete flag
-        ])
+    def get_parquet_path(self, database, table):
+        """Generate parquet file path based on database and table."""
+        return f"{database}/{table}/{table}_data.parquet"
 
     # =========================
     # Service Health Check
@@ -176,11 +136,11 @@ class FlinkProcessor:
     # Kafka Consumer
     # =========================
     def connect_kafka(self):
-        """Create Kafka consumer."""
+        """Create Kafka consumer for both PostgreSQL and MS SQL topics."""
         try:
             self.consumer = KafkaConsumer(
-                "mcc-changes",
-                "mpass-changes",
+                "postgres-mcc-changes",
+                "mssql-mpass-changes",
                 bootstrap_servers=self.kafka_servers.split(","),
                 value_deserializer=lambda m: json.loads(m.decode("utf-8")),
                 auto_offset_reset="earliest",
@@ -188,279 +148,278 @@ class FlinkProcessor:
                 group_id="flink-processor-group",
             )
             logger.info("✓ Connected to Kafka consumer")
+            logger.info("  Topics: postgres-mcc-changes, mssql-mpass-changes")
         except KafkaError as e:
             logger.error(f"Kafka connection failed: {e}")
             raise
 
     # =========================
+    # Auto-detect and Cache Schema
+    # =========================
+    def get_or_create_schema(self, data_dict, table_key):
+        """Auto-detect schema from data and cache it."""
+        if table_key in self.schema_cache:
+            # Kiểm tra xem có cột mới không
+            existing_fields = set(self.schema_cache[table_key].names)
+            new_fields = set(data_dict.keys())
+            
+            if new_fields - existing_fields:
+                logger.info(f"Detected new columns for {table_key}: {new_fields - existing_fields}")
+                # Tạo lại schema với cột mới
+                self.schema_cache[table_key] = self._build_schema(data_dict)
+            
+            return self.schema_cache[table_key]
+        else:
+            # Tạo schema mới
+            schema = self._build_schema(data_dict)
+            self.schema_cache[table_key] = schema
+            logger.info(f"✓ Created schema for {table_key} with {len(schema.names)} columns")
+            logger.debug(f"  Columns: {', '.join(schema.names)}")
+            return schema
+
+    def _build_schema(self, data_dict):
+        """Build PyArrow schema from dictionary."""
+        fields = []
+        
+        # Sort keys để đảm bảo thứ tự cố định
+        for key in sorted(data_dict.keys()):
+            fields.append((key, pa.string()))
+        
+        return pa.schema(fields)
+
+    # =========================
     # Generate Unique Record ID
     # =========================
-    def generate_record_id(self, record):
-        table = str(record.get('source_table') or record.get('table') or '').upper()
-        stt = str(record.get('stt') or '')
-        return f"{table}_{stt}"
-
+    def generate_record_id(self, data, table_name, database_name):
+        """Generate unique ID from primary key or hash."""
+        # Thử các trường primary key phổ biến
+        pk_fields = ['id', 'stt', 'ma_gd', 'ma_giao_dich', 'ma_kh']
+        
+        for field in pk_fields:
+            if field in data and data[field] and str(data[field]).strip():
+                return f"{database_name}_{table_name}_{data[field]}"
+        
+        # Nếu không có PK, dùng hash
+        import hashlib
+        data_str = json.dumps(data, sort_keys=True)
+        hash_id = hashlib.md5(data_str.encode()).hexdigest()[:16]
+        return f"{database_name}_{table_name}_{hash_id}"
 
     # =========================
-    # Transform Logic
+    # Transform Logic - Keep 100% Original Structure
     # =========================
-    def transform_to_bangke(self, record):
-        """Transform record from MCC/MPASS → BangKe."""
+    def transform_record(self, record):
+        """Transform record by adding metadata, keeping ALL original columns."""
         try:
-            table_name = record.get("table")
-            operation = record.get("operation")
+            # Lấy metadata từ record
+            table_name = str(record.get("table", "")).lower()
+            database_name = str(record.get("database", ""))
+            source_type = str(record.get("source", ""))
+            operation = str(record.get("operation", ""))
             data = record.get("data", {})
-
-            # Convert to ISO format string
-            processed_at = datetime.now().isoformat()
-
-            # Helper function to safely convert to string
-            def safe_str(value):
-                return str(value) if value is not None else ''
-
-            # Initialize with empty strings
-            bangke = {
-                'source_table': str(table_name or ''),
-                'operation': str(operation or ''),
-                'processed_at': processed_at,
-                'stt': '',
-                'ma_kh': '',
-                'ma_hd': '',
-                'nv_quan_ly': '',
-                'ma_nhan_vien': '',
-                'ma_lai_xe': '',
-                'id_cuoc_xe': '',
-                'so_the': '',
-                'ten_tren_the': '',
-                'san_pham': '',
-                'so_tien': '',
-                'so_giao_dich': '',
-                'ma_giao_dich': '',
-                'ma_tai': '',
-                'ngay_giao_dich': '',
-                'thoi_diem_giao_dich': '',
-                'ngay_di_thuc_te': '',
-                'ngay_hieu_luc': '',
-                'bien_so_xe': '',
-                'diem_don': '',
-                'diem_tra': '',
-                'don_vi_phat_sinh': '',
-                'ma_dv_phat_sinh': '',
-                'ten_dv_phat_sinh': '',
-                'ma_dv_quan_ly_kh': '',
-                'ten_dv_quan_ly_kh': '',
-                'trang_thai_giao_dich': '',
-                'loai_giao_dich': '',
-                'ghi_chu': '',
-                'is_deleted': False
-            }
-
-            # Mapping MCC → BangKe
-            if table_name == 'MCC':
-                bangke.update({
-                    'stt': safe_str(data.get('stt', '')),
-                    'so_the': safe_str(data.get('so_the', '')),
-                    'san_pham': safe_str(data.get('san_pham', '')),
-                    'ngay_di_thuc_te': safe_str(data.get('ngay_di_thuc_te', '')),
-                    'ngay_hieu_luc': safe_str(data.get('ngay_hieu_luc', '')),
-                    'ten_tren_the': safe_str(data.get('ten_in_tren_the', '')),
-                    'bien_so_xe': safe_str(data.get('bs_xe', '')),
-                    'ma_nhan_vien': safe_str(data.get('ma_nv', '')),
-                    'so_tien': safe_str(data.get('so_tien', '')),
-                    'so_giao_dich': safe_str(data.get('so_giao_dich', '')),
-                    'diem_don': safe_str(data.get('diem_don_ghi_chu', '')),
-                    'diem_tra': safe_str(data.get('diem_tra', '')),
-                    'don_vi_phat_sinh': safe_str(data.get('don_vi_phat_sinh', '')),
-                    'ghi_chu': safe_str(data.get('ghi_chu', ''))
-                })
-
-            # Mapping MPASS → BangKe
-            elif table_name == 'MPASS':
-                bangke.update({
-                    'stt': safe_str(data.get('stt', '')),
-                    'ma_kh': safe_str(data.get('ma_kh', '')),
-                    'ma_hd': safe_str(data.get('ma_hd', '')),
-                    'nv_quan_ly': safe_str(data.get('nv_quan_ly', '')),
-                    'ma_lai_xe': safe_str(data.get('ma_lai_xe', '')),
-                    'id_cuoc_xe': safe_str(data.get('id_cuoc_xe', '')),
-                    'so_the': safe_str(data.get('so_the', '')),
-                    'ten_tren_the': safe_str(data.get('ten_in_tren_the', '')),
-                    'san_pham': safe_str(data.get('san_pham', '')),
-                    'so_tien': safe_str(data.get('so_tien', '')),
-                    'ma_giao_dich': safe_str(data.get('ma_gd', '')),
-                    'ma_tai': safe_str(data.get('so_tai', '')),
-                    'thoi_diem_giao_dich': safe_str(data.get('thoi_diem_giao_dich', '')),
-                    'ma_dv_phat_sinh': safe_str(data.get('ma_dv_phat_sinh_gd', '')),
-                    'ten_dv_phat_sinh': safe_str(data.get('ten_dv_phat_sinh_gd', '')),
-                    'trang_thai_giao_dich': safe_str(data.get('trang_thai', '')),
-                    'loai_giao_dich': safe_str(data.get('loai_gd', ''))
-                })
-
-            # Generate unique ID
-            bangke['id'] = self.generate_record_id(bangke)
             
-            # Handle DELETE operation
-            if operation and operation.upper() == 'DELETE':
-                bangke['is_deleted'] = True
+            # Parse JSON string nếu data là string
+            if isinstance(data, str):
+                try:
+                    data = json.loads(data)
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse data JSON: {e}")
+                    return None, None, None
 
-            return bangke
+            # Helper: convert any value to string safely
+            def safe_str(value):
+                if value is None:
+                    return ''
+                if isinstance(value, (dict, list)):
+                    return json.dumps(value)
+                return str(value)
+
+            # Tạo transformed record với metadata + ALL original data
+            transformed = {}
+            
+            # 1. Metadata fields (luôn ở đầu)
+            transformed['_source_database'] = database_name
+            transformed['_source_table'] = table_name
+            transformed['_source_type'] = source_type
+            transformed['_operation'] = operation
+            transformed['_processed_at'] = datetime.now().isoformat()
+            
+            # 2. Auto-generate record_id
+            record_id = self.generate_record_id(data, table_name, database_name)
+            transformed['_record_id'] = record_id
+            
+            # 3. Copy TẤT CẢ các field từ data gốc (không filter, không hardcode)
+            for key, value in data.items():
+                transformed[key] = safe_str(value)
+            
+            return transformed, table_name, database_name
 
         except Exception as e:
             logger.error(f"Transform error: {e}")
             logger.exception(e)
-            return None
+            return None, None, None
 
     # =========================
     # Read Existing Parquet File
     # =========================
-    def read_existing_data(self):
+    def read_existing_data(self, parquet_path):
         """Read existing parquet file from MinIO."""
         try:
             import io
             
-            # Download file from MinIO
             response = self.s3_client.get_object(
                 Bucket=self.data_bucket,
-                Key=self.parquet_file_key
+                Key=parquet_path
             )
             
-            # Read parquet file
             parquet_bytes = response['Body'].read()
             buffer = io.BytesIO(parquet_bytes)
             table = pq.read_table(buffer)
             
-            logger.info(f"✓ Read existing data: {len(table)} records")
+            logger.info(f"✓ Read {len(table)} records from {parquet_path}")
             return table
             
         except ClientError as e:
             if e.response['Error']['Code'] == 'NoSuchKey':
-                logger.info("No existing parquet file found, will create new one")
+                logger.info(f"No existing file at {parquet_path}, will create new")
                 return None
             else:
                 raise
         except Exception as e:
-            logger.error(f"Error reading existing data: {e}")
+            logger.error(f"Error reading {parquet_path}: {e}")
             return None
 
     # =========================
-    # Update Parquet File
+    # Update Parquet File with Auto Schema
     # =========================
-    def update_parquet_file(self, new_record):
+    def update_parquet_file(self, new_record, parquet_path, table_key):
+        """Update parquet file with auto-detected schema."""
         try:
             import io
 
-            existing_table = self.read_existing_data()
+            existing_table = self.read_existing_data(parquet_path)
             df_new = pd.DataFrame([new_record])
 
             if existing_table is not None:
                 df_existing = existing_table.to_pandas()
 
-                # --- 1) đảm bảo df_new có đầy đủ cột ---
-                for col in df_existing.columns:
-                    if col not in df_new.columns:
-                        df_new[col] = '' if col != 'is_deleted' else False
-                for col in df_new.columns:
+                # Merge columns từ cả 2 dataframes
+                all_columns = sorted(set(df_existing.columns) | set(df_new.columns))
+                
+                # Đảm bảo cả 2 df có đủ cột
+                for col in all_columns:
                     if col not in df_existing.columns:
-                        df_existing[col] = '' if col != 'is_deleted' else False
-                df_new = df_new[df_existing.columns]
+                        df_existing[col] = ''
+                        logger.info(f"  Added new column to existing data: {col}")
+                    if col not in df_new.columns:
+                        df_new[col] = ''
+                
+                # Sắp xếp cột theo thứ tự
+                df_existing = df_existing[all_columns]
+                df_new = df_new[all_columns]
 
-                # --- 2) dùng index theo 'id' ---
-                df_existing['id'] = df_existing['id'].astype(str)
-                df_new['id'] = df_new['id'].astype(str)
-                df_existing.set_index('id', inplace=True, drop=False)
-                df_new.set_index('id', inplace=True, drop=False)
+                # Use _record_id as index
+                df_existing['_record_id'] = df_existing['_record_id'].astype(str)
+                df_new['_record_id'] = df_new['_record_id'].astype(str)
+                df_existing.set_index('_record_id', inplace=True, drop=False)
+                df_new.set_index('_record_id', inplace=True, drop=False)
 
                 record_id = str(df_new.index[0])
-                operation = new_record.get('operation', '').upper()
+                operation = new_record.get('_operation', '').upper()
 
                 if record_id in df_existing.index:
                     if operation == 'DELETE':
-                        # ✅ HARD DELETE: xóa hẳn dòng khỏi DataFrame
                         df_existing = df_existing.drop(record_id, errors='ignore')
-                        logger.info(f"✓ Hard deleted record: {record_id}")
+                        logger.info(f"  Deleted: {record_id}")
                     else:
-                        # UPDATE
                         for col in df_existing.columns:
                             df_existing.at[record_id, col] = df_new.at[record_id, col]
-                        logger.info(f"✓ Updated existing record: {record_id}")
-
+                        logger.info(f"  Updated: {record_id}")
                     df_combined = df_existing.reset_index(drop=True)
-
                 else:
                     if operation == 'DELETE':
-                        # Không chèn bản ghi mới nếu xóa mà không tồn tại
-                        logger.warning(f"⚠ Delete requested for non-existing ID: {record_id} — skipping.")
+                        logger.warning(f"  Delete for non-existing ID: {record_id}")
                         df_combined = df_existing.reset_index(drop=True)
                     else:
-                        # INSERT
                         df_combined = pd.concat(
                             [df_existing.reset_index(drop=True), df_new.reset_index(drop=True)],
                             ignore_index=True
                         )
-                        logger.info(f"✓ Inserted new record: {record_id}")
-
+                        logger.info(f"  Inserted: {record_id}")
             else:
-                # Chưa có file parquet cũ → tạo mới
                 df_combined = pd.DataFrame([new_record])
-                logger.info(f"✓ Created first record: {new_record.get('id')}")
+                logger.info(f"  Created first record: {new_record.get('_record_id')}")
 
-            # --- 3) Chuẩn hóa kiểu dữ liệu ---
+            # Convert all to string
             for col in df_combined.columns:
-                if col == 'is_deleted':
-                    df_combined[col] = df_combined[col].astype(bool)
-                else:
-                    df_combined[col] = df_combined[col].astype(str)
+                df_combined[col] = df_combined[col].astype(str)
 
-            # --- 4) Ghi lại parquet ---
-            arrow_table = pa.Table.from_pandas(df_combined, schema=self.arrow_schema)
+            # Auto-detect schema
+            if len(df_combined) > 0:
+                sample_record = df_combined.iloc[0].to_dict()
+                arrow_schema = self.get_or_create_schema(sample_record, table_key)
+            else:
+                arrow_schema = self.get_or_create_schema(new_record, table_key)
+
+            # Write parquet
+            arrow_table = pa.Table.from_pandas(df_combined, schema=arrow_schema)
             buffer = io.BytesIO()
             pq.write_table(arrow_table, buffer, compression='snappy')
             buffer.seek(0)
 
             self.s3_client.put_object(
                 Bucket=self.data_bucket,
-                Key=self.parquet_file_key,
+                Key=parquet_path,
                 Body=buffer.getvalue()
             )
 
-            logger.info(f"✓ Updated parquet file: s3://{self.data_bucket}/{self.parquet_file_key}")
-            logger.info(f"Total records in file: {len(df_combined)}")
+            logger.info(f"✓ Saved: s3://{self.data_bucket}/{parquet_path} ({len(df_combined)} records, {len(arrow_schema.names)} columns)")
 
         except Exception as e:
-            logger.error(f"Error updating parquet file: {e}")
+            logger.error(f"Error updating parquet: {e}")
             logger.exception(e)
             raise
-
 
     # =========================
     # Process Stream
     # =========================
     def process(self):
-        """Main streaming process."""
+        """Main streaming process with auto schema detection."""
         self.wait_for_services()
         self.connect_kafka()
         
-        logger.info("🚀 Start consuming Kafka messages...")
+        logger.info("=" * 60)
+        logger.info("🚀 Start consuming with AUTO SCHEMA DETECTION")
+        logger.info("  All columns from source tables will be preserved")
+        logger.info("=" * 60)
 
         for message in self.consumer:
             try:
                 self.record_count += 1
                 record = message.value
                 
-                logger.info(f"[{self.record_count}] Received message: {json.dumps(record)[:200]}")
+                source_info = f"{record.get('source')}.{record.get('database')}.{record.get('table')}"
+                logger.info(f"\n[{self.record_count}] Received from {source_info}")
                 
-                bangke_record = self.transform_to_bangke(record)
+                # Transform (giữ 100% cấu trúc gốc + metadata)
+                transformed, table_name, database_name = self.transform_record(record)
                 
-                if bangke_record:
-                    self.update_parquet_file(bangke_record)
+                if transformed and table_name and database_name:
+                    # Tạo path động
+                    parquet_path = self.get_parquet_path(database_name, table_name)
+                    table_key = f"{database_name}.{table_name}"
+                    
+                    # Update parquet với auto schema
+                    self.update_parquet_file(transformed, parquet_path, table_key)
+                    
                     logger.info(
-                        f"[{self.record_count}] ✓ "
-                        f"{bangke_record['source_table']} | "
-                        f"{bangke_record['operation']} | "
-                        f"ID: {bangke_record['id']}"
+                        f"[{self.record_count}] ✓ Processed | "
+                        f"Op: {transformed['_operation']:10} | "
+                        f"Cols: {len(transformed)} | "
+                        f"Path: {parquet_path}"
                     )
                 else:
-                    logger.warning(f"[{self.record_count}] Failed to transform record")
+                    logger.warning(f"[{self.record_count}] Failed to transform")
                     
             except Exception as e:
                 logger.error(f"Processing error: {e}")
