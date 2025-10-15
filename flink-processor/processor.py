@@ -1,3 +1,41 @@
+# processor_batch_singlefile.py
+"""
+Iceberg-like Batch+Stream Processor (single Parquet data file per table)
+
+Behavior:
+- INIT LOAD: when no data file exists for a table, performs an initial load in batches
+  (batch size controlled by INIT_BATCH_SIZE env var). After init completes, switches
+  to streaming mode for that table.
+- STREAM: every incoming Kafka event (INSERT/UPDATE/DELETE) is applied immediately
+  (per-record). For correctness we read the current single Parquet file, merge the
+  single-row change, and write back the file (atomic via temp object + copy).
+- Metadata: every change (batch, stream, or schema change) creates a snapshot entry
+  and writes a change-log (JSONL) and an error-log (JSONL if errors occur).
+
+Notes / tradeoffs:
+- Per-record streaming applies changes by reading+merging+writing the whole table.
+  This is simple and robust when throughput is moderate. For very high write QPS
+  consider switching to micro-batching or a different storage layout (partitioned
+  files, append-only + compaction).
+- Schema evolution: schema inferred from resulting DataFrame after each operation
+  (all columns stored as strings). If schema changes compared to metadata, it
+  creates a `schema_change` snapshot and logs it.
+
+Environment variables used (defaults):
+- KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+- FLINK_JOBMANAGER_HOST=jobmanager
+- FLINK_JOBMANAGER_PORT=8081
+- S3_ENDPOINT=http://minio:9000
+- S3_ACCESS_KEY=admin
+- S3_SECRET_KEY=password123
+- WAREHOUSE_PATH=warehouse
+- BATCH_SIZE=100  # for general batching (not init)
+- BATCH_TIMEOUT=30
+- INIT_BATCH_SIZE=1000 # batch size used during initial load
+- AWS_REGION=us-east-1
+
+"""
+
 import os
 import json
 import time
@@ -5,6 +43,7 @@ import logging
 import socket
 import requests
 import pandas as pd
+import uuid
 from datetime import datetime
 from kafka import KafkaConsumer
 from kafka.errors import KafkaError
@@ -13,56 +52,66 @@ import pyarrow.parquet as pq
 import boto3
 from botocore.client import Config
 from botocore.exceptions import ClientError
+from collections import defaultdict
 
 # =========================
-# Logging Configuration
+# Logging configuration
 # =========================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger("FlinkProcessor")
+logger = logging.getLogger("IcebergBatchProcessor")
 
 # =========================
-# Processor Class
+# Processor
 # =========================
-class FlinkProcessor:
+class IcebergBatchProcessor:
     def __init__(self):
         # Kafka + Flink
         self.kafka_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
         self.flink_host = os.getenv("FLINK_JOBMANAGER_HOST", "jobmanager")
         self.flink_port = os.getenv("FLINK_JOBMANAGER_PORT", "8081")
 
-        # MinIO credentials
+        # MinIO / S3
         self.s3_endpoint = os.getenv("S3_ENDPOINT", "http://minio:9000")
         self.s3_access_key = os.getenv("S3_ACCESS_KEY", "admin")
         self.s3_secret_key = os.getenv("S3_SECRET_KEY", "password123")
-        self.data_bucket = os.getenv("DATA_BUCKET", "iceberg-data")
+        self.warehouse_path = os.getenv("WAREHOUSE_PATH", "warehouse")
+
+        # Batch settings
+        self.batch_size = int(os.getenv("BATCH_SIZE", "100"))
+        self.batch_timeout = int(os.getenv("BATCH_TIMEOUT", "30"))
+        self.init_batch_size = int(os.getenv("INIT_BATCH_SIZE", "1000"))
 
         self.consumer = None
         self.record_count = 0
-        
-        # Cache để lưu schema của từng table
-        self.schema_cache = {}
 
-        logger.info("=== Flink Processor Configuration ===")
+        # Batch buffer for general-purpose batching (not used for stream per-record)
+        self.batch_buffer = defaultdict(list)
+        self.batch_timestamps = {}
+
+        # Cache
+        self.schema_cache = {}
+        self.table_metadata_cache = {}
+        # track tables that already finished init load
+        self.init_loaded_tables = set()
+
+        logger.info("=== Iceberg Batch Processor (single file, init-batch + stream-per-record) ===")
         logger.info(f"Kafka: {self.kafka_servers}")
-        logger.info(f"Flink JobManager: {self.flink_host}:{self.flink_port}")
-        logger.info(f"MinIO Endpoint: {self.s3_endpoint}")
-        logger.info(f"Data Bucket: {self.data_bucket}")
-        logger.info("Auto-detecting schemas from incoming data...")
+        logger.info(f"MinIO: {self.s3_endpoint}")
+        logger.info(f"Warehouse: s3a://{self.warehouse_path}")
+        logger.info(f"Batch Size: {self.batch_size} records")
+        logger.info(f"Init Batch Size: {self.init_batch_size} records")
 
         # Setup S3 Client
         self.s3_client = self.setup_s3_client()
-        
-        # Create MinIO bucket if not exists
-        self.ensure_bucket_exists()
+        self.ensure_bucket_exists(self.warehouse_path)
 
     # =========================
-    # Setup S3 Client
+    # S3 helpers
     # =========================
     def setup_s3_client(self):
-        """Initialize boto3 S3 client for MinIO."""
         try:
             s3_client = boto3.client(
                 's3',
@@ -70,73 +119,520 @@ class FlinkProcessor:
                 aws_access_key_id=self.s3_access_key,
                 aws_secret_access_key=self.s3_secret_key,
                 config=Config(signature_version='s3v4'),
-                region_name='us-east-1'
+                region_name=os.getenv('AWS_REGION', 'us-east-1')
             )
-            logger.info("✓ S3 client initialized successfully")
+            logger.info("✓ S3 client initialized")
             return s3_client
-            
         except Exception as e:
-            logger.error(f"❌ Failed to initialize S3 client: {e}")
+            logger.error(f"❌ Failed to initialize S3: {e}")
             raise
 
-    # =========================
-    # Ensure MinIO Bucket Exists
-    # =========================
-    def ensure_bucket_exists(self):
-        """Create MinIO bucket if it doesn't exist."""
+    def ensure_bucket_exists(self, bucket_name):
         try:
             try:
-                self.s3_client.head_bucket(Bucket=self.data_bucket)
-                logger.info(f"✓ Bucket '{self.data_bucket}' already exists")
+                self.s3_client.head_bucket(Bucket=bucket_name)
+                logger.info(f"✓ Bucket '{bucket_name}' exists")
             except ClientError:
-                self.s3_client.create_bucket(Bucket=self.data_bucket)
-                logger.info(f"✓ Created bucket '{self.data_bucket}'")
-                
+                self.s3_client.create_bucket(Bucket=bucket_name)
+                logger.info(f"✓ Created bucket '{bucket_name}'")
         except Exception as e:
-            logger.error(f"❌ Could not verify/create bucket: {e}")
+            logger.error(f"❌ Bucket error: {e}")
             raise
 
     # =========================
-    # Get Parquet Path for Table
+    # Paths
     # =========================
-    def get_parquet_path(self, database, table):
-        """Generate parquet file path based on database and table."""
-        return f"{database}/{table}/{table}_data.parquet"
+    def get_table_base_path(self, database, table):
+        return f"{database}/{table}"
+
+    def get_metadata_path(self, database, table):
+        return f"{self.get_table_base_path(database, table)}/metadata"
+
+    def get_data_path(self, database, table):
+        return f"{self.get_table_base_path(database, table)}/data"
+
+    def get_data_file_key(self, database, table):
+        # single data file per table
+        return f"{self.get_data_path(database, table)}/{table}.parquet"
 
     # =========================
-    # Service Health Check
+    # Metadata management (simplified)
     # =========================
-    def wait_for_services(self):
-        """Wait until Kafka and Flink are available."""
-        logger.info("Waiting for Kafka...")
-        host, port = self.kafka_servers.split(":")
-        for i in range(30):
+    def load_table_metadata(self, database, table):
+        table_key = f"{database}.{table}"
+        if table_key in self.table_metadata_cache:
+            return self.table_metadata_cache[table_key]
+
+        version_hint_path = f"{self.get_metadata_path(database, table)}/version-hint.text"
+        try:
+            response = self.s3_client.get_object(Bucket=self.warehouse_path, Key=version_hint_path)
+            current_version = int(response['Body'].read().decode('utf-8').strip())
+            metadata_file_path = f"{self.get_metadata_path(database, table)}/v{current_version}.metadata.json"
+            response = self.s3_client.get_object(Bucket=self.warehouse_path, Key=metadata_file_path)
+            metadata = json.loads(response['Body'].read().decode('utf-8'))
+            self.table_metadata_cache[table_key] = metadata
+            return metadata
+        except ClientError:
+            # not found -> new
+            metadata = self.create_new_table_metadata(database, table)
+            self.table_metadata_cache[table_key] = metadata
+            return metadata
+        except Exception as e:
+            logger.debug(f"Metadata load error: {e}")
+            metadata = self.create_new_table_metadata(database, table)
+            self.table_metadata_cache[table_key] = metadata
+            return metadata
+
+    def create_new_table_metadata(self, database, table):
+        table_uuid = str(uuid.uuid4())
+        metadata = {
+            "format-version": 2,
+            "table-uuid": table_uuid,
+            "location": f"s3a://{self.warehouse_path}/{self.get_table_base_path(database, table)}",
+            "last-updated-ms": int(datetime.now().timestamp() * 1000),
+            "last-column-id": 0,
+            "schemas": [],
+            "current-schema-id": -1,
+            "partition-specs": [{"spec-id": 0, "fields": []}],
+            "default-spec-id": 0,
+            "last-partition-id": 0,
+            "properties": {"owner": "flink-processor", "created-at": datetime.now().isoformat()},
+            "current-snapshot-id": -1,
+            "snapshots": [],
+            "snapshot-log": [],
+            "metadata-log": [],
+            "sort-orders": [],
+            "refs": {}
+        }
+        return metadata
+
+    def save_metadata(self, database, table, metadata):
+        metadata_log_count = len(metadata.get('metadata-log', []))
+        new_version = metadata_log_count + 1
+        metadata['last-updated-ms'] = int(datetime.now().timestamp() * 1000)
+        metadata['metadata-log'].append({
+            "metadata-file": f"{self.get_metadata_path(database, table)}/v{new_version}.metadata.json",
+            "timestamp-ms": metadata['last-updated-ms']
+        })
+        metadata_file_path = f"{self.get_metadata_path(database, table)}/v{new_version}.metadata.json"
+        self.s3_client.put_object(Bucket=self.warehouse_path, Key=metadata_file_path, Body=json.dumps(metadata, indent=2).encode('utf-8'))
+        version_hint_path = f"{self.get_metadata_path(database, table)}/version-hint.text"
+        self.s3_client.put_object(Bucket=self.warehouse_path, Key=version_hint_path, Body=str(new_version).encode('utf-8'))
+        logger.info(f"✓ Saved metadata v{new_version} for {database}.{table}")
+        self.table_metadata_cache[f"{database}.{table}"] = metadata
+
+    def add_schema_to_metadata(self, metadata, arrow_schema):
+        schema_id = len(metadata['schemas'])
+        last_column_id = metadata.get('last-column-id', 0)
+        fields = []
+        for f in arrow_schema:
+            last_column_id += 1
+            fields.append({"id": last_column_id, "name": f.name, "required": True, "type": "string"})
+        metadata['schemas'].append({"schema-id": schema_id, "type": "struct", "fields": fields})
+        metadata['current-schema-id'] = schema_id
+        metadata['last-column-id'] = last_column_id
+        return schema_id
+
+    # =========================
+    # Utility: atomic write of data file using temp + copy
+    # =========================
+    def atomic_write_data_file(self, database, table, bytes_data):
+        final_key = self.get_data_file_key(database, table)
+        temp_key = f"{self.get_data_path(database, table)}/._tmp_{uuid.uuid4().hex}.parquet"
+        # upload temp
+        self.s3_client.put_object(Bucket=self.warehouse_path, Key=temp_key, Body=bytes_data)
+        # copy temp -> final (overwrite)
+        copy_source = {'Bucket': self.warehouse_path, 'Key': temp_key}
+        self.s3_client.copy_object(Bucket=self.warehouse_path, CopySource=copy_source, Key=final_key)
+        # delete temp
+        self.s3_client.delete_object(Bucket=self.warehouse_path, Key=temp_key)
+        return final_key
+
+    # =========================
+    # Schema management helper
+    # =========================
+    def df_to_arrow_schema(self, df):
+        cols = sorted(df.columns.tolist())
+        fields = [(c, pa.string()) for c in cols]
+        return pa.schema(fields)
+
+    # =========================
+    # Read existing single data file (returns pyarrow.Table or None)
+    # =========================
+    def read_existing_table(self, database, table):
+        key = self.get_data_file_key(database, table)
+        try:
+            resp = self.s3_client.get_object(Bucket=self.warehouse_path, Key=key)
+            import io
+            data = resp['Body'].read()
+            buf = io.BytesIO(data)
+            table = pq.read_table(buf)
+            return table
+        except ClientError as e:
+            logger.debug(f"No data file for {database}.{table}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Error reading existing table {database}.{table}: {e}")
+            return None
+
+    # =========================
+    # Logs: change-log (jsonl) and error-log
+    # =========================
+    def write_change_log(self, database, table, change_entries):
+        ts = int(time.time() * 1000)
+        key = f"{self.get_metadata_path(database, table)}/changes-{ts}.jsonl"
+        payload = "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in change_entries)
+        self.s3_client.put_object(Bucket=self.warehouse_path, Key=key, Body=payload)
+        return key
+
+    def write_error_log(self, database, table, error_entries):
+        if not error_entries:
+            return None
+        ts = int(time.time() * 1000)
+        key = f"{self.get_metadata_path(database, table)}/errors-{ts}.jsonl"
+        payload = "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in error_entries)
+        self.s3_client.put_object(Bucket=self.warehouse_path, Key=key, Body=payload)
+        return key
+
+    # =========================
+    # Snapshot & manifest helpers
+    # =========================
+    def create_manifest_file(self, database, table, data_file_path, record_count, file_size, operation_summary):
+        manifest_id = str(uuid.uuid4())
+        manifest_path = f"{self.get_metadata_path(database, table)}/manifest-{manifest_id}.avro"
+        manifest_entry = {
+            "status": 1,
+            "snapshot_id": None,
+            "data_file": {
+                "file_path": data_file_path,
+                "file_format": "PARQUET",
+                "record_count": record_count,
+                "file_size_in_bytes": file_size,
+                "partition": {},
+                "batch_summary": operation_summary
+            }
+        }
+        content = json.dumps([manifest_entry], indent=2)
+        self.s3_client.put_object(Bucket=self.warehouse_path, Key=manifest_path, Body=content.encode('utf-8'))
+        return manifest_path
+
+    def create_manifest_list(self, database, table, manifest_files, total_records):
+        manifest_list_id = str(uuid.uuid4())
+        manifest_list_path = f"{self.get_metadata_path(database, table)}/snap-{manifest_list_id}.avro"
+        manifest_list = []
+        for manifest_path in manifest_files:
+            manifest_list.append({
+                "manifest_path": manifest_path,
+                "manifest_length": 0,
+                "partition_spec_id": 0,
+                "added_snapshot_id": None,
+                "added_data_files_count": 1,
+                "existing_data_files_count": 0,
+                "deleted_data_files_count": 0,
+                "added_rows_count": total_records,
+                "existing_rows_count": 0,
+                "deleted_rows_count": 0
+            })
+        content = json.dumps(manifest_list, indent=2)
+        self.s3_client.put_object(Bucket=self.warehouse_path, Key=manifest_list_path, Body=content.encode('utf-8'))
+        return manifest_list_path
+
+    def create_snapshot(self, metadata, manifest_list_path, operation_summary, change_log_path=None, change_type='stream'):
+        snapshot_id = int(time.time() * 1000)
+        snapshot = {
+            "snapshot-id": snapshot_id,
+            "timestamp-ms": snapshot_id,
+            "summary": {
+                "type": change_type,
+                "operation": operation_summary.get('primary_operation', ''),
+                "total-records": operation_summary.get('total_records', 0),
+                "file_size": operation_summary.get('file_size', 0),
+                "batch-size": operation_summary.get('batch_size', 0),
+                "batch-inserts": operation_summary.get('inserts', 0),
+                "batch-updates": operation_summary.get('updates', 0),
+                "batch-deletes": operation_summary.get('deletes', 0),
+                "batch-duration-ms": operation_summary.get('duration_ms', 0),
+                "change-log": change_log_path
+            },
+            "manifest-list": manifest_list_path,
+            "schema-id": metadata.get('current-schema-id', -1)
+        }
+        metadata['snapshots'].append(snapshot)
+        metadata['current-snapshot-id'] = snapshot_id
+        metadata['refs']['main'] = {"snapshot-id": snapshot_id, "type": "branch"}
+        metadata['snapshot-log'].append({"snapshot-id": snapshot_id, "timestamp-ms": snapshot_id})
+        return snapshot_id
+
+    # =========================
+    # Record helpers
+    # =========================
+    def generate_record_id(self, data, table_name, database_name):
+        pk_fields = ['id', 'stt', 'ma_gd', 'ma_giao_dich', 'ma_kh']
+        for field in pk_fields:
+            if field in data and data[field] and str(data[field]).strip():
+                return f"{database_name}_{table_name}_{data[field]}"
+        import hashlib
+        data_str = json.dumps(data, sort_keys=True)
+        hash_id = hashlib.md5(data_str.encode()).hexdigest()[:16]
+        return f"{database_name}_{table_name}_{hash_id}"
+
+    def transform_record(self, record):
+        try:
+            table_name = str(record.get("table", "")).lower()
+            database_name = str(record.get("database", ""))
+            source_type = str(record.get("source", ""))
+            operation = str(record.get("operation", "")).upper()
+            data = record.get("data", {})
+            if isinstance(data, str):
+                data = json.loads(data)
+
+            def safe_str(value):
+                if value is None:
+                    return ''
+                if isinstance(value, (dict, list)):
+                    return json.dumps(value, ensure_ascii=False)
+                return str(value)
+
+            transformed = {
+                '_source_database': database_name,
+                '_source_table': table_name,
+                '_source_type': source_type,
+                '_operation': operation,
+                '_processed_at': datetime.now().isoformat()
+            }
+
+            for key, value in data.items():
+                transformed[key] = safe_str(value)
+
+            transformed['_record_id'] = self.generate_record_id(data, table_name, database_name)
+            return transformed, table_name, database_name, operation
+        except Exception as e:
+            logger.error(f"Transform error: {e}")
+            return None, None, None, None
+
+    # =========================
+    # INIT LOAD (batching): used only when no data exists for the table
+    # =========================
+    def process_init_batches(self, table_key, records):
+        """Process records in batches (init). `records` is list of transformed dicts."""
+        database, table = table_key.split('.')
+        errors = []
+        change_logs = []
+        total_written = 0
+
+        # chunk into init_batch_size
+        for i in range(0, len(records), self.init_batch_size):
+            chunk = records[i:i + self.init_batch_size]
             try:
-                s = socket.create_connection((host, int(port)), timeout=2)
-                s.close()
-                logger.info("✓ Kafka is ready")
-                break
-            except Exception:
-                time.sleep(3)
-                if i == 29:
-                    raise Exception("Kafka not available after retries")
+                df_chunk = pd.DataFrame(chunk).astype(str)
 
-        logger.info("Waiting for Flink JobManager...")
-        for i in range(20):
-            try:
-                r = requests.get(f"http://{self.flink_host}:{self.flink_port}/overview", timeout=3)
-                if r.status_code == 200:
-                    logger.info("✓ Flink JobManager is ready")
-                    return
-            except:
-                time.sleep(3)
-        logger.warning("⚠ Flink not ready, continuing anyway...")
+                # If there is no existing table, we just write chunk as new table (append)
+                existing_table = self.read_existing_table(database, table)
+                if existing_table is not None:
+                    df_existing = existing_table.to_pandas().astype(str)
+                    all_columns = sorted(set(df_existing.columns) | set(df_chunk.columns))
+                    for c in all_columns:
+                        if c not in df_existing.columns:
+                            df_existing[c] = ''
+                        if c not in df_chunk.columns:
+                            df_chunk[c] = ''
+                    df_combined = pd.concat([df_existing, df_chunk], ignore_index=True)[all_columns]
+                else:
+                    df_combined = df_chunk
+
+                # schema
+                arrow_schema = self.df_to_arrow_schema(df_combined)
+                schema_changed = False
+                metadata = self.load_table_metadata(database, table)
+                if metadata['current-schema-id'] == -1 or metadata.get('schemas') == []:
+                    self.add_schema_to_metadata(metadata, arrow_schema)
+                    schema_changed = True
+
+                # write data (overwrite single file)
+                import io
+                arrow_table = pa.Table.from_pandas(df_combined, schema=arrow_schema)
+                buf = io.BytesIO()
+                pq.write_table(arrow_table, buf, compression='snappy')
+                buf.seek(0)
+                bytes_data = buf.getvalue()
+                data_key = self.atomic_write_data_file(database, table, bytes_data)
+                file_size = len(bytes_data)
+
+                batch_duration = 0  # small, not measured here
+                op_counts = {'INSERT': len(df_chunk), 'UPDATE': 0, 'DELETE': 0}
+                op_summary = {
+                    'batch_size': len(df_chunk),
+                    'inserts': op_counts['INSERT'],
+                    'updates': 0,
+                    'deletes': 0,
+                    'total_records': len(df_combined),
+                    'file_size': file_size,
+                    'primary_operation': 'batch',
+                    'duration_ms': batch_duration
+                }
+
+                # change log for batch: record-level entries
+                for r in chunk:
+                    change_logs.append({
+                        'record_id': r.get('_record_id'),
+                        'operation': r.get('_operation', 'INSERT'),
+                        'before': None,
+                        'after': r,
+                        'processed_at': datetime.now().isoformat()
+                    })
+
+                # persist change log and metadata
+                change_log_path = self.write_change_log(database, table, change_logs)
+                manifest_path = self.create_manifest_file(database, table, data_key, len(df_combined), file_size, op_summary)
+                manifest_list_path = self.create_manifest_list(database, table, [manifest_path], len(df_combined))
+                self.create_snapshot(metadata, manifest_list_path, op_summary, change_log_path=change_log_path, change_type='batch')
+                self.save_metadata(database, table, metadata)
+
+                total_written += len(df_chunk)
+                # after first successful write, mark init done
+                self.init_loaded_tables.add(table_key)
+
+                # clear chunk change logs to avoid duplication in next iteration
+                change_logs = []
+
+            except Exception as e:
+                err = {"table": table_key, "error": str(e), "time": datetime.now().isoformat()}
+                errors.append(err)
+                logger.exception(f"Init batch error for {table_key}: {e}")
+
+        if errors:
+            self.write_error_log(database, table, errors)
+        return total_written
 
     # =========================
-    # Kafka Consumer
+    # STREAM per-record processing
+    # - read existing table -> merge single record -> write back
+    # - update metadata + change-log for each record
+    # =========================
+    def process_stream_record(self, table_key, record):
+        database, table = table_key.split('.')
+        errors = []
+        try:
+            op = str(record.get('_operation', 'INSERT')).upper()
+            rec_id = record.get('_record_id')
+
+            # load existing
+            existing_table = self.read_existing_table(database, table)
+            if existing_table is not None:
+                df_existing = existing_table.to_pandas().astype(str)
+            else:
+                # no data -> empty df
+                df_existing = pd.DataFrame()
+
+            # ensure _record_id column
+            if '_record_id' not in df_existing.columns:
+                df_existing['_record_id'] = ''
+
+            # normalize new row
+            df_new = pd.DataFrame([record]).astype(str)
+            if '_record_id' not in df_new.columns:
+                df_new['_record_id'] = rec_id
+
+            # compute merged columns
+            all_columns = sorted(set(df_existing.columns) | set(df_new.columns))
+            for c in all_columns:
+                if c not in df_existing.columns:
+                    df_existing[c] = ''
+                if c not in df_new.columns:
+                    df_new[c] = ''
+
+            df_existing.set_index('_record_id', inplace=True, drop=False)
+            df_new.set_index('_record_id', inplace=True, drop=False)
+
+            before = df_existing.loc[rec_id].to_dict() if rec_id in df_existing.index else None
+
+            if op == 'DELETE':
+                if rec_id in df_existing.index:
+                    df_existing = df_existing.drop(rec_id)
+                    after = None
+                else:
+                    # delete on missing row -> no-op (but log)
+                    after = None
+            elif rec_id in df_existing.index:
+                # update: overwrite columns present in new
+                for col in df_new.columns:
+                    df_existing.at[rec_id, col] = df_new.at[rec_id, col]
+                after = df_existing.loc[rec_id].to_dict()
+            else:
+                # insert
+                df_existing = pd.concat([df_existing, df_new.loc[[rec_id]]])
+                after = df_new.loc[rec_id].to_dict()
+
+            df_combined = df_existing.reset_index(drop=True).fillna('').astype(str)
+
+            # schema detection
+            arrow_schema = self.df_to_arrow_schema(df_combined)
+            metadata = self.load_table_metadata(database, table)
+            schema_changed = False
+            if metadata['current-schema-id'] == -1:
+                # first-time schema
+                self.add_schema_to_metadata(metadata, arrow_schema)
+                schema_changed = True
+
+            # if schema fields different from last schema, add schema and mark
+            cached_schema_names = set(self.schema_cache.get(table_key, []).names) if table_key in self.schema_cache else set()
+            current_schema_names = set(df_combined.columns)
+            if table_key not in self.schema_cache or cached_schema_names != current_schema_names:
+                schema_changed = True
+                self.schema_cache[table_key] = pa.schema([(c, pa.string()) for c in sorted(current_schema_names)])
+                self.add_schema_to_metadata(metadata, arrow_schema)
+
+            # write data (atomic)
+            import io
+            arrow_table = pa.Table.from_pandas(df_combined, schema=self.schema_cache[table_key])
+            buf = io.BytesIO()
+            pq.write_table(arrow_table, buf, compression='snappy')
+            buf.seek(0)
+            bytes_data = buf.getvalue()
+            data_key = self.atomic_write_data_file(database, table, bytes_data)
+            file_size = len(bytes_data)
+
+            # change log entry
+            change_entry = {
+                'record_id': rec_id,
+                'operation': op,
+                'before': before,
+                'after': after,
+                'processed_at': datetime.now().isoformat()
+            }
+            change_log_path = self.write_change_log(database, table, [change_entry])
+
+            # manifest & snapshot
+            op_summary = {
+                'batch_size': 1,
+                'inserts': 1 if op == 'INSERT' else 0,
+                'updates': 1 if op == 'UPDATE' else 0,
+                'deletes': 1 if op == 'DELETE' else 0,
+                'total_records': len(df_combined),
+                'file_size': file_size,
+                'primary_operation': op.lower(),
+                'duration_ms': 0
+            }
+            manifest_path = self.create_manifest_file(database, table, data_key, len(df_combined), file_size, op_summary)
+            manifest_list_path = self.create_manifest_list(database, table, [manifest_path], len(df_combined))
+
+            change_type = 'schema_change' if schema_changed else 'stream'
+            self.create_snapshot(metadata, manifest_list_path, op_summary, change_log_path=change_log_path, change_type=change_type)
+            self.save_metadata(database, table, metadata)
+
+            logger.info(f"Processed stream op={op} for {table_key} rec={rec_id} (schema_changed={schema_changed})")
+
+        except Exception as e:
+            err = {"table": table_key, "record_id": record.get('_record_id'), "error": str(e), "time": datetime.now().isoformat()}
+            logger.exception(f"Stream processing error for {table_key}: {e}")
+            self.write_error_log(database, table, [err])
+            errors.append(err)
+        return errors
+
+    # =========================
+    # Kafka consumer
     # =========================
     def connect_kafka(self):
-        """Create Kafka consumer for both PostgreSQL and MS SQL topics."""
         try:
             self.consumer = KafkaConsumer(
                 "postgres-mcc-changes",
@@ -145,297 +641,101 @@ class FlinkProcessor:
                 value_deserializer=lambda m: json.loads(m.decode("utf-8")),
                 auto_offset_reset="earliest",
                 enable_auto_commit=True,
-                group_id="flink-processor-group",
+                group_id="iceberg-batch-processor-group",
             )
-            logger.info("✓ Connected to Kafka consumer")
-            logger.info("  Topics: postgres-mcc-changes, mssql-mpass-changes")
+            logger.info("✓ Connected to Kafka")
         except KafkaError as e:
-            logger.error(f"Kafka connection failed: {e}")
+            logger.error(f"Kafka error: {e}")
             raise
 
     # =========================
-    # Auto-detect and Cache Schema
-    # =========================
-    def get_or_create_schema(self, data_dict, table_key):
-        """Auto-detect schema from data and cache it."""
-        if table_key in self.schema_cache:
-            # Kiểm tra xem có cột mới không
-            existing_fields = set(self.schema_cache[table_key].names)
-            new_fields = set(data_dict.keys())
-            
-            if new_fields - existing_fields:
-                logger.info(f"Detected new columns for {table_key}: {new_fields - existing_fields}")
-                # Tạo lại schema với cột mới
-                self.schema_cache[table_key] = self._build_schema(data_dict)
-            
-            return self.schema_cache[table_key]
-        else:
-            # Tạo schema mới
-            schema = self._build_schema(data_dict)
-            self.schema_cache[table_key] = schema
-            logger.info(f"✓ Created schema for {table_key} with {len(schema.names)} columns")
-            logger.debug(f"  Columns: {', '.join(schema.names)}")
-            return schema
-
-    def _build_schema(self, data_dict):
-        """Build PyArrow schema from dictionary."""
-        fields = []
-        
-        # Sort keys để đảm bảo thứ tự cố định
-        for key in sorted(data_dict.keys()):
-            fields.append((key, pa.string()))
-        
-        return pa.schema(fields)
-
-    # =========================
-    # Generate Unique Record ID
-    # =========================
-    def generate_record_id(self, data, table_name, database_name):
-        """Generate unique ID from primary key or hash."""
-        # Thử các trường primary key phổ biến
-        pk_fields = ['id', 'stt', 'ma_gd', 'ma_giao_dich', 'ma_kh']
-        
-        for field in pk_fields:
-            if field in data and data[field] and str(data[field]).strip():
-                return f"{database_name}_{table_name}_{data[field]}"
-        
-        # Nếu không có PK, dùng hash
-        import hashlib
-        data_str = json.dumps(data, sort_keys=True)
-        hash_id = hashlib.md5(data_str.encode()).hexdigest()[:16]
-        return f"{database_name}_{table_name}_{hash_id}"
-
-    # =========================
-    # Transform Logic - Keep 100% Original Structure
-    # =========================
-    def transform_record(self, record):
-        """Transform record by adding metadata, keeping ALL original columns."""
-        try:
-            # Lấy metadata từ record
-            table_name = str(record.get("table", "")).lower()
-            database_name = str(record.get("database", ""))
-            source_type = str(record.get("source", ""))
-            operation = str(record.get("operation", ""))
-            data = record.get("data", {})
-            
-            # Parse JSON string nếu data là string
-            if isinstance(data, str):
-                try:
-                    data = json.loads(data)
-                except json.JSONDecodeError as e:
-                    logger.error(f"Failed to parse data JSON: {e}")
-                    return None, None, None
-
-            # Helper: convert any value to string safely
-            def safe_str(value):
-                if value is None:
-                    return ''
-                if isinstance(value, (dict, list)):
-                    return json.dumps(value)
-                return str(value)
-
-            # Tạo transformed record với metadata + ALL original data
-            transformed = {}
-            
-            # 1. Metadata fields (luôn ở đầu)
-            transformed['_source_database'] = database_name
-            transformed['_source_table'] = table_name
-            transformed['_source_type'] = source_type
-            transformed['_operation'] = operation
-            transformed['_processed_at'] = datetime.now().isoformat()
-            
-            # 2. Auto-generate record_id
-            record_id = self.generate_record_id(data, table_name, database_name)
-            transformed['_record_id'] = record_id
-            
-            # 3. Copy TẤT CẢ các field từ data gốc (không filter, không hardcode)
-            for key, value in data.items():
-                transformed[key] = safe_str(value)
-            
-            return transformed, table_name, database_name
-
-        except Exception as e:
-            logger.error(f"Transform error: {e}")
-            logger.exception(e)
-            return None, None, None
-
-    # =========================
-    # Read Existing Parquet File
-    # =========================
-    def read_existing_data(self, parquet_path):
-        """Read existing parquet file from MinIO."""
-        try:
-            import io
-            
-            response = self.s3_client.get_object(
-                Bucket=self.data_bucket,
-                Key=parquet_path
-            )
-            
-            parquet_bytes = response['Body'].read()
-            buffer = io.BytesIO(parquet_bytes)
-            table = pq.read_table(buffer)
-            
-            logger.info(f"✓ Read {len(table)} records from {parquet_path}")
-            return table
-            
-        except ClientError as e:
-            if e.response['Error']['Code'] == 'NoSuchKey':
-                logger.info(f"No existing file at {parquet_path}, will create new")
-                return None
-            else:
-                raise
-        except Exception as e:
-            logger.error(f"Error reading {parquet_path}: {e}")
-            return None
-
-    # =========================
-    # Update Parquet File with Auto Schema
-    # =========================
-    def update_parquet_file(self, new_record, parquet_path, table_key):
-        """Update parquet file with auto-detected schema."""
-        try:
-            import io
-
-            existing_table = self.read_existing_data(parquet_path)
-            df_new = pd.DataFrame([new_record])
-
-            if existing_table is not None:
-                df_existing = existing_table.to_pandas()
-
-                # Merge columns từ cả 2 dataframes
-                all_columns = sorted(set(df_existing.columns) | set(df_new.columns))
-                
-                # Đảm bảo cả 2 df có đủ cột
-                for col in all_columns:
-                    if col not in df_existing.columns:
-                        df_existing[col] = ''
-                        logger.info(f"  Added new column to existing data: {col}")
-                    if col not in df_new.columns:
-                        df_new[col] = ''
-                
-                # Sắp xếp cột theo thứ tự
-                df_existing = df_existing[all_columns]
-                df_new = df_new[all_columns]
-
-                # Use _record_id as index
-                df_existing['_record_id'] = df_existing['_record_id'].astype(str)
-                df_new['_record_id'] = df_new['_record_id'].astype(str)
-                df_existing.set_index('_record_id', inplace=True, drop=False)
-                df_new.set_index('_record_id', inplace=True, drop=False)
-
-                record_id = str(df_new.index[0])
-                operation = new_record.get('_operation', '').upper()
-
-                if record_id in df_existing.index:
-                    if operation == 'DELETE':
-                        df_existing = df_existing.drop(record_id, errors='ignore')
-                        logger.info(f"  Deleted: {record_id}")
-                    else:
-                        for col in df_existing.columns:
-                            df_existing.at[record_id, col] = df_new.at[record_id, col]
-                        logger.info(f"  Updated: {record_id}")
-                    df_combined = df_existing.reset_index(drop=True)
-                else:
-                    if operation == 'DELETE':
-                        logger.warning(f"  Delete for non-existing ID: {record_id}")
-                        df_combined = df_existing.reset_index(drop=True)
-                    else:
-                        df_combined = pd.concat(
-                            [df_existing.reset_index(drop=True), df_new.reset_index(drop=True)],
-                            ignore_index=True
-                        )
-                        logger.info(f"  Inserted: {record_id}")
-            else:
-                df_combined = pd.DataFrame([new_record])
-                logger.info(f"  Created first record: {new_record.get('_record_id')}")
-
-            # Convert all to string
-            for col in df_combined.columns:
-                df_combined[col] = df_combined[col].astype(str)
-
-            # Auto-detect schema
-            if len(df_combined) > 0:
-                sample_record = df_combined.iloc[0].to_dict()
-                arrow_schema = self.get_or_create_schema(sample_record, table_key)
-            else:
-                arrow_schema = self.get_or_create_schema(new_record, table_key)
-
-            # Write parquet
-            arrow_table = pa.Table.from_pandas(df_combined, schema=arrow_schema)
-            buffer = io.BytesIO()
-            pq.write_table(arrow_table, buffer, compression='snappy')
-            buffer.seek(0)
-
-            self.s3_client.put_object(
-                Bucket=self.data_bucket,
-                Key=parquet_path,
-                Body=buffer.getvalue()
-            )
-
-            logger.info(f"✓ Saved: s3://{self.data_bucket}/{parquet_path} ({len(df_combined)} records, {len(arrow_schema.names)} columns)")
-
-        except Exception as e:
-            logger.error(f"Error updating parquet: {e}")
-            logger.exception(e)
-            raise
-
-    # =========================
-    # Process Stream
+    # Main processing loop
     # =========================
     def process(self):
-        """Main streaming process with auto schema detection."""
-        self.wait_for_services()
+        # ensure services ready (best-effort)
+        try:
+            self.wait_for_services()
+        except Exception:
+            logger.warning("Service wait failed or skipped")
+
         self.connect_kafka()
-        
-        logger.info("=" * 60)
-        logger.info("🚀 Start consuming with AUTO SCHEMA DETECTION")
-        logger.info("  All columns from source tables will be preserved")
-        logger.info("=" * 60)
+        logger.info("🚀 Processor started (init-batch + stream-per-record)")
+
+        # Maintain an init buffer per table until init load done
+        init_buffers = defaultdict(list)
 
         for message in self.consumer:
             try:
                 self.record_count += 1
                 record = message.value
-                
-                source_info = f"{record.get('source')}.{record.get('database')}.{record.get('table')}"
-                logger.info(f"\n[{self.record_count}] Received from {source_info}")
-                
-                # Transform (giữ 100% cấu trúc gốc + metadata)
-                transformed, table_name, database_name = self.transform_record(record)
-                
-                if transformed and table_name and database_name:
-                    # Tạo path động
-                    parquet_path = self.get_parquet_path(database_name, table_name)
-                    table_key = f"{database_name}.{table_name}"
-                    
-                    # Update parquet với auto schema
-                    self.update_parquet_file(transformed, parquet_path, table_key)
-                    
-                    logger.info(
-                        f"[{self.record_count}] ✓ Processed | "
-                        f"Op: {transformed['_operation']:10} | "
-                        f"Cols: {len(transformed)} | "
-                        f"Path: {parquet_path}"
-                    )
+                transformed, table_name, database_name, operation = self.transform_record(record)
+                if not transformed or not table_name or not database_name:
+                    logger.warning(f"[{self.record_count}] Failed to transform record")
+                    continue
+
+                table_key = f"{database_name}.{table_name}"
+
+                # If table not init-loaded yet (no data file), buffer for init; otherwise stream-process
+                if table_key not in self.init_loaded_tables:
+                    # check if data exists on S3; if exists mark init_loaded
+                    if self.read_existing_table(database_name, table_name) is not None:
+                        self.init_loaded_tables.add(table_key)
+                        logger.info(f"Detected existing data for {table_key}, switching to stream mode")
+
+                if table_key not in self.init_loaded_tables:
+                    # buffer for initial load
+                    init_buffers[table_key].append(transformed)
+                    logger.info(f"[{self.record_count}] Buffered for INIT: {table_key} | {len(init_buffers[table_key])} records")
+
+                    # if buffered reaches init_batch_size -> process init batches
+                    if len(init_buffers[table_key]) >= self.init_batch_size:
+                        total = self.process_init_batches(table_key, init_buffers[table_key])
+                        logger.info(f"Init load completed chunk for {table_key} -> {total} records written")
+                        init_buffers[table_key] = []
+
                 else:
-                    logger.warning(f"[{self.record_count}] Failed to transform")
-                    
+                    # streaming per-record
+                    self.process_stream_record(table_key, transformed)
+
             except Exception as e:
-                logger.error(f"Processing error: {e}")
-                logger.exception(e)
+                logger.exception(f"Processing loop error: {e}")
+
+    # Optional: wait_for_services (same as previous)
+    def wait_for_services(self):
+        logger.info("Waiting for Kafka...")
+        try:
+            host, port = self.kafka_servers.split(":")
+            for _ in range(10):
+                try:
+                    s = socket.create_connection((host, int(port)), timeout=2)
+                    s.close()
+                    logger.info("✓ Kafka ready")
+                    break
+                except Exception:
+                    time.sleep(1)
+        except Exception:
+            logger.debug("Skipping Kafka wait")
+
+        logger.info("Waiting for Flink JobManager... (best-effort)")
+        try:
+            for _ in range(5):
+                try:
+                    r = requests.get(f"http://{self.flink_host}:{self.flink_port}/overview", timeout=2)
+                    if r.status_code == 200:
+                        logger.info("✓ Flink ready")
+                        return
+                except:
+                    time.sleep(1)
+        except Exception:
+            logger.debug("Skipping Flink wait")
 
 
-# =========================
-# Main Entry Point
-# =========================
 if __name__ == "__main__":
     try:
-        processor = FlinkProcessor()
+        processor = IcebergBatchProcessor()
         processor.process()
     except KeyboardInterrupt:
-        logger.info("Shutting down processor...")
+        logger.info("Shutting down...")
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        logger.exception(e)
+        logger.exception(f"Fatal: {e}")
         raise
