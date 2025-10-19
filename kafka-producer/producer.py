@@ -6,7 +6,7 @@ import logging
 import select
 import threading
 from typing import Optional
-
+import hashlib
 import psycopg2
 import psycopg2.extensions
 import pymssql
@@ -120,7 +120,8 @@ class UnifiedKafkaProducer:
 
     def postgres_initial_load(self):
         if not self.enable_postgres or not self.pg_connection:
-            return
+            return {}
+
         try:
             cursor = self.pg_connection.cursor()
             logger.info(f"🚀 Starting initial load: PostgreSQL.{self.pg_table}")
@@ -129,78 +130,109 @@ class UnifiedKafkaProducer:
             rows = cursor.fetchall()
             total = len(rows)
             logger.info(f"Found {total} rows in {self.pg_table}")
-            
+
+            last_snapshot = {}
             for idx, row in enumerate(rows, start=1):
+                record = dict(zip(columns, row))
+                record_id = record.get("stt")
+                if record_id is None:
+                    continue
+                last_snapshot[record_id] = record
+
                 payload = {
                     "operation": "INITIAL_LOAD",
                     "table": self.pg_table,
                     "database": self.pg_config['database'],
                     "source": "postgresql",
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "data": dict(zip(columns, row))
+                    "data": record
                 }
                 self.producer.send(self.pg_topic, value=payload)
+
                 if idx % 500 == 0:
                     logger.info(f"PostgreSQL: Sent {idx}/{total} rows")
                     self.producer.flush()
-            
+
             self.producer.flush()
             logger.info(f"✓ PostgreSQL initial load completed ({total} rows)")
             cursor.close()
+            return last_snapshot
         except Exception as e:
             logger.exception("❌ PostgreSQL initial load error")
+            return {}
 
-    def postgres_listen_loop(self):
+
+    def postgres_poll_loop(self):
+        """Sau khi init load, chỉ phát hiện INSERT / UPDATE / DELETE mới"""
         if not self.enable_postgres:
             return
-        
-        backoff = 1
-        logger.info(f"Starting PostgreSQL listener thread for {self.pg_table}")
-        
+
+        logger.info(f"Starting PostgreSQL polling thread for {self.pg_table}")
+        last_snapshot = self.postgres_initial_load()  # lấy snapshot sau init load
+
         while True:
             try:
-                if not self.pg_connection or getattr(self.pg_connection, "closed", 1) != 0:
-                    logger.info("PostgreSQL: Reconnecting...")
+                if not self.pg_connection or self.pg_connection.closed:
                     self.connect_postgres()
-                
+
                 cursor = self.pg_connection.cursor()
-                cursor.execute("UNLISTEN *;")
-                cursor.execute("LISTEN mcc_changes;")
-                logger.info("✓ PostgreSQL LISTEN registered: mcc_changes")
-                
-                while True:
-                    ready = select.select([self.pg_connection], [], [], 5)
-                    if ready[0]:
-                        self.pg_connection.poll()
-                        while self.pg_connection.notifies:
-                            notify = self.pg_connection.notifies.pop(0)
-                            try:
-                                payload = json.loads(notify.payload)
-                                self.producer.send(self.pg_topic, value=payload)
-                                
-                                with self.lock:
-                                    self.message_count += 1
-                                    count = self.message_count
-                                
-                                operation = payload.get('operation', 'UNKNOWN')
-                                logger.info(
-                                    f"[{count}] ✓ PostgreSQL | "
-                                    f"Table: {self.pg_table} | Op: {operation:10} | "
-                                    f"Topic: {self.pg_topic}"
-                                )
-                            except Exception as e:
-                                logger.exception("Error processing PostgreSQL notification")
-                
-                backoff = 1
-                
-            except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
-                logger.error(f"PostgreSQL connection error: {e}")
-                self._close_postgres()
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 30)
+                cursor.execute(f"SELECT * FROM {self.pg_table};")
+                columns = [desc[0] for desc in cursor.description]
+                rows = cursor.fetchall()
+                cursor.close()
+
+                current_snapshot = {}
+                for row in rows:
+                    record = dict(zip(columns, row))
+                    record_id = record.get("stt")
+                    if record_id is None:
+                        continue
+                    current_snapshot[record_id] = record
+
+                    old_record = last_snapshot.get(record_id)
+                    if not old_record:
+                        op = "INSERT"
+                    elif old_record != record:
+                        op = "UPDATE"
+                    else:
+                        continue
+
+                    payload = {
+                        "operation": op,
+                        "table": self.pg_table,
+                        "database": self.pg_config["database"],
+                        "source": "postgresql",
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "data": record,
+                    }
+                    self.producer.send(self.pg_topic, value=payload)
+                    with self.lock:
+                        self.message_count += 1
+                        logger.info(f"[{self.message_count}] PostgreSQL {op} stt={record_id}")
+
+                # Xử lý DELETE
+                deleted_ids = set(last_snapshot.keys()) - set(current_snapshot.keys())
+                for record_id in deleted_ids:
+                    payload = {
+                        "operation": "DELETE",
+                        "table": self.pg_table,
+                        "database": self.pg_config["database"],
+                        "source": "postgresql",
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "data": {"id": record_id},
+                    }
+                    self.producer.send(self.pg_topic, value=payload)
+                    with self.lock:
+                        self.message_count += 1
+                        logger.info(f"[{self.message_count}] PostgreSQL DELETE stt={record_id}")
+
+                last_snapshot = current_snapshot
+                time.sleep(10)
+
             except Exception as e:
-                logger.exception("Unexpected error in PostgreSQL loop")
+                logger.exception("Error in PostgreSQL polling loop")
                 time.sleep(5)
+
 
     def _close_postgres(self):
         try:
@@ -239,7 +271,8 @@ class UnifiedKafkaProducer:
 
     def mssql_initial_load(self):
         if not self.enable_mssql or not self.mssql_connection:
-            return
+            return {}
+
         try:
             cursor = self.mssql_connection.cursor(as_dict=True)
             logger.info(f"🚀 Starting initial load: MSSQL.{self.mssql_table}")
@@ -247,8 +280,17 @@ class UnifiedKafkaProducer:
             rows = cursor.fetchall()
             total = len(rows)
             logger.info(f"Found {total} rows in {self.mssql_table}")
-            
+
+            last_snapshot = {}
             for idx, row in enumerate(rows, start=1):
+                record_id = row.get(os.getenv("MSSQL_PRIMARY_KEY", "stt"))
+                if record_id is None:
+                    continue
+
+                # Tính hash để so sánh nhanh sau này
+                row_hash = hashlib.md5(json.dumps(row, default=str, sort_keys=True).encode()).hexdigest()
+                last_snapshot[record_id] = row_hash
+
                 payload = {
                     "operation": "INITIAL_LOAD",
                     "table": self.mssql_table,
@@ -258,67 +300,101 @@ class UnifiedKafkaProducer:
                     "data": row
                 }
                 self.producer.send(self.mssql_topic, value=payload)
+
                 if idx % 500 == 0:
-                    logger.info(f"MS SQL: Sent {idx}/{total} rows")
+                    logger.info(f"MSSQL: Sent {idx}/{total} rows")
                     self.producer.flush()
-            
+
             self.producer.flush()
-            logger.info(f"✓ MS SQL initial load completed ({total} rows)")
+            logger.info(f"✓ MSSQL initial load completed ({total} rows)")
             cursor.close()
-        except Exception as e:
-            logger.exception("❌ MS SQL initial load error")
+            return last_snapshot
+
+        except Exception:
+            logger.exception("❌ MSSQL initial load error")
+            return {}
+
 
     def mssql_poll_loop(self):
         if not self.enable_mssql:
             return
-        
-        backoff = 1
-        last_processed_id = 0
-        logger.info(f"Starting MS SQL poller thread for {self.mssql_table} (interval: {self.mssql_poll_interval}s)")
-        
+
+        primary_key = os.getenv("MSSQL_PRIMARY_KEY", "stt")
+        logger.info(f"Starting MSSQL polling thread for {self.mssql_table}, PK = {primary_key}")
+
+        # 👉 Gọi initial load và lưu snapshot
+        if not self.mssql_connection:
+            self.connect_mssql()
+        last_snapshot = self.mssql_initial_load()
+
         while True:
             try:
                 if not self.mssql_connection:
-                    logger.info("MS SQL: Reconnecting...")
                     self.connect_mssql()
 
                 cursor = self.mssql_connection.cursor(as_dict=True)
-                cursor.execute(f"""
-                    SELECT TOP 100 id, operation, changed_at, data
-                    FROM mpass_audit_log
-                    WHERE id > {last_processed_id}
-                    ORDER BY id ASC
-                """)
-                audit_rows = cursor.fetchall()
-                
-                for row in audit_rows:
-                    try:
-                        payload = json.loads(row['data'])
-                        self.producer.send(self.mssql_topic, value=payload)
-                        
-                        with self.lock:
-                            self.message_count += 1
-                            count = self.message_count
-                        
-                        logger.info(
-                            f"[{count}] ✓ MS SQL (audit) | "
-                            f"Op: {row['operation']:10} | Topic: {self.mssql_topic}"
-                        )
-                        last_processed_id = row['id']
-                    except Exception as e:
-                        logger.exception("Error processing MS SQL audit log")
-                
+                cursor.execute(f"SELECT * FROM {self.mssql_table};")
+                rows = cursor.fetchall()
                 cursor.close()
-                backoff = 1
+
+                current_snapshot = {}
+                for row in rows:
+                    record_id = row.get(primary_key)
+                    if record_id is None:
+                        continue
+
+                    row_hash = hashlib.md5(json.dumps(row, default=str, sort_keys=True).encode()).hexdigest()
+                    current_snapshot[record_id] = row_hash
+
+                    old_hash = last_snapshot.get(record_id)
+
+                    if old_hash is None:
+                        op = "INSERT"
+                    elif old_hash != row_hash:
+                        op = "UPDATE"
+                    else:
+                        continue
+
+                    payload = {
+                        "operation": op,
+                        "table": self.mssql_table,
+                        "database": self.mssql_config["database"],
+                        "source": "mssql",
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "data": row,
+                    }
+
+                    self.producer.send(self.mssql_topic, value=payload)
+                    with self.lock:
+                        self.message_count += 1
+                        logger.info(f"[{self.message_count}] MSSQL {op} {primary_key}={record_id}")
+
+                # DELETE detection
+                deleted_ids = set(last_snapshot.keys()) - set(current_snapshot.keys())
+                for record_id in deleted_ids:
+                    payload = {
+                        "operation": "DELETE",
+                        "table": self.mssql_table,
+                        "database": self.mssql_config["database"],
+                        "source": "mssql",
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "data": {"id": record_id},
+                    }
+                    self.producer.send(self.mssql_topic, value=payload)
+                    with self.lock:
+                        self.message_count += 1
+                        logger.info(f"[{self.message_count}] MSSQL DELETE {primary_key}={record_id}")
+
+                # Cập nhật snapshot để so sánh cho lần sau
+                last_snapshot = current_snapshot
                 time.sleep(self.mssql_poll_interval)
-                
-            except pymssql.Error as e:
-                logger.error(f"MS SQL connection error: {e}")
+
+            except pymssql.OperationalError as e:
+                logger.error(f"⚠️ MSSQL connection lost: {e}, reconnecting...")
                 self._close_mssql()
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 30)
-            except Exception as e:
-                logger.exception("Unexpected error in MS SQL loop")
+                time.sleep(3)
+            except Exception:
+                logger.exception("Error in MSSQL polling loop")
                 time.sleep(5)
 
 
@@ -361,7 +437,7 @@ class UnifiedKafkaProducer:
             threads = []
             
             if self.enable_postgres:
-                pg_thread = threading.Thread(target=self.postgres_listen_loop, daemon=True)
+                pg_thread = threading.Thread(target=self.postgres_poll_loop, daemon=True)
                 pg_thread.start()
                 threads.append(pg_thread)
             
