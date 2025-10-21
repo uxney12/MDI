@@ -6,6 +6,7 @@ import socket
 import requests
 import pandas as pd
 import uuid
+import io
 from datetime import datetime
 from kafka import KafkaConsumer
 from kafka.errors import KafkaError
@@ -240,6 +241,31 @@ class IcebergBatchProcessor:
         except Exception as e:
             logger.error(f"Error reading existing table {database}.{table}: {e}")
             return None
+        
+    def _write_back_table_with_schema(self, database, table, df):
+        arrow_schema = self.df_to_arrow_schema(df)
+        arrow_table = pa.Table.from_pandas(df, schema=arrow_schema)
+        buf = io.BytesIO()
+        pq.write_table(arrow_table, buf, compression='snappy')
+        buf.seek(0)
+        data_bytes = buf.getvalue()
+        self.atomic_write_data_file(database, table, data_bytes)
+        metadata = self.load_table_metadata(database, table)
+        self.add_schema_to_metadata(metadata, arrow_schema)
+        self.save_metadata(database, table, metadata)
+
+    def _rename_table_in_s3(self, database, old_table, new_table):
+        """Move all keys under old_table → new_table in S3"""
+        prefix_old = f"{database}/{old_table}/"
+        prefix_new = f"{database}/{new_table}/"
+        response = self.s3_client.list_objects_v2(Bucket=self.warehouse_path, Prefix=prefix_old)
+        for obj in response.get("Contents", []):
+            old_key = obj["Key"]
+            new_key = old_key.replace(prefix_old, prefix_new, 1)
+            self.s3_client.copy_object(Bucket=self.warehouse_path, CopySource={"Bucket": self.warehouse_path, "Key": old_key}, Key=new_key)
+            self.s3_client.delete_object(Bucket=self.warehouse_path, Key=old_key)
+        logger.info(f"✓ Renamed S3 path {prefix_old} → {prefix_new}")
+
 
     # =========================
     # Logs: change-log (jsonl) and error-log
@@ -607,6 +633,96 @@ class IcebergBatchProcessor:
             errors.append(err)
         return errors
     
+
+    # =========================
+    # DDL processing
+    # =========================
+    def process_ddl_event(self, payload):
+        op = payload.get("operation", "").upper()
+        db = payload.get("database")
+        table = payload.get("table")
+        logger.info(f"Processing DDL event: {op} on {db}.{table}")
+
+        if not db:
+            logger.warning("DDL payload missing database")
+            return
+
+        # 1️⃣ ADD_TABLE
+        if op == "ADD_TABLE":
+            if not table:
+                logger.warning("Missing table name in ADD_TABLE")
+                return
+            df_empty = pd.DataFrame()
+            arrow_schema = self.df_to_arrow_schema(df_empty)
+            metadata = self.create_new_table_metadata(db, table)
+            self.add_schema_to_metadata(metadata, arrow_schema)
+            self.save_metadata(db, table, metadata)
+            logger.info(f"✓ Created empty table {db}.{table}")
+
+        # 2️⃣ DROP_TABLE  → rename {table}_deleted
+        elif op == "DROP_TABLE":
+            if not table:
+                return
+            new_table = f"{table}_deleted"
+            logger.info(f"Renaming dropped table {table} → {new_table}")
+            self._rename_table_in_s3(db, table, new_table)
+
+        # 3️⃣ RENAME_TABLE
+        elif op == "RENAME_TABLE":
+            old = payload.get("old_table")
+            new = payload.get("new_table")
+            if not old or not new:
+                return
+            logger.info(f"Renaming table {old} → {new}")
+            self._rename_table_in_s3(db, old, new)
+
+        # 4️⃣ ADD_COLUMN
+        elif op == "ADD_COLUMN":
+            col = payload.get("column")
+            default = payload.get("default", "")
+            if not col:
+                return
+            existing_table = self.read_existing_table(db, table)
+            if existing_table is None:
+                logger.warning(f"Table {db}.{table} not found for ADD_COLUMN")
+                return
+            df = existing_table.to_pandas().astype(str)
+            if col not in df.columns:
+                df[col] = default
+            self._write_back_table_with_schema(db, table, df)
+            logger.info(f"✓ Added column {col} (default={default}) to {db}.{table}")
+
+        # 5️⃣ RENAME_COLUMN
+        elif op == "RENAME_COLUMN":
+            old_col = payload.get("old_column")
+            new_col = payload.get("new_column")
+            if not old_col or not new_col:
+                return
+            existing_table = self.read_existing_table(db, table)
+            if existing_table is None:
+                return
+            df = existing_table.to_pandas().astype(str)
+            if old_col in df.columns:
+                df.rename(columns={old_col: new_col}, inplace=True)
+                self._write_back_table_with_schema(db, table, df)
+                logger.info(f"✓ Renamed column {old_col} → {new_col} in {db}.{table}")
+
+        # 6️⃣ DROP_COLUMN → rename {col}_deleted
+        elif op == "DROP_COLUMN":
+            col = payload.get("column")
+            if not col:
+                return
+            existing_table = self.read_existing_table(db, table)
+            if existing_table is None:
+                return
+            df = existing_table.to_pandas().astype(str)
+            if col in df.columns:
+                new_col = f"{col}_deleted"
+                df.rename(columns={col: new_col}, inplace=True)
+                self._write_back_table_with_schema(db, table, df)
+                logger.info(f"✓ Renamed column {col} → {new_col} (DROP_COLUMN) in {db}.{table}")
+
+    
     # =========================
     # Kafka consumer
     # =========================
@@ -630,7 +746,6 @@ class IcebergBatchProcessor:
     # Main processing loop
     # =========================
     def process(self):
-        # ensure services ready (best-effort)
         try:
             self.wait_for_services()
         except Exception:
@@ -670,6 +785,10 @@ class IcebergBatchProcessor:
                             init_buffers[table_key] = []
                         continue  
 
+                if operation in ("ADD_TABLE", "DROP_TABLE", "RENAME_TABLE", "ADD_COLUMN", "DROP_COLUMN", "RENAME_COLUMN"):
+                    self.process_ddl_event(record)
+                    continue
+
                 if operation in ("INSERT", "UPDATE", "DELETE"):
                         self.process_stream_record(table_key, transformed)
 
@@ -678,7 +797,6 @@ class IcebergBatchProcessor:
                 logger.exception(f"Processing loop error: {e}")
 
 
-    # Optional: wait_for_services (same as previous)
     def wait_for_services(self):
         logger.info("Waiting for Kafka...")
         try:
