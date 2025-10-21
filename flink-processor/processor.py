@@ -1,41 +1,3 @@
-# processor_batch_singlefile.py
-"""
-Iceberg-like Batch+Stream Processor (single Parquet data file per table)
-
-Behavior:
-- INIT LOAD: when no data file exists for a table, performs an initial load in batches
-  (batch size controlled by INIT_BATCH_SIZE env var). After init completes, switches
-  to streaming mode for that table.
-- STREAM: every incoming Kafka event (INSERT/UPDATE/DELETE) is applied immediately
-  (per-record). For correctness we read the current single Parquet file, merge the
-  single-row change, and write back the file (atomic via temp object + copy).
-- Metadata: every change (batch, stream, or schema change) creates a snapshot entry
-  and writes a change-log (JSONL) and an error-log (JSONL if errors occur).
-
-Notes / tradeoffs:
-- Per-record streaming applies changes by reading+merging+writing the whole table.
-  This is simple and robust when throughput is moderate. For very high write QPS
-  consider switching to micro-batching or a different storage layout (partitioned
-  files, append-only + compaction).
-- Schema evolution: schema inferred from resulting DataFrame after each operation
-  (all columns stored as strings). If schema changes compared to metadata, it
-  creates a `schema_change` snapshot and logs it.
-
-Environment variables used (defaults):
-- KAFKA_BOOTSTRAP_SERVERS=kafka:29092
-- FLINK_JOBMANAGER_HOST=jobmanager
-- FLINK_JOBMANAGER_PORT=8081
-- S3_ENDPOINT=http://minio:9000
-- S3_ACCESS_KEY=admin
-- S3_SECRET_KEY=password123
-- WAREHOUSE_PATH=warehouse
-- BATCH_SIZE=100  # for general batching (not init)
-- BATCH_TIMEOUT=30
-- INIT_BATCH_SIZE=1000 # batch size used during initial load
-- AWS_REGION=us-east-1
-
-"""
-
 import os
 import json
 import time
@@ -53,6 +15,7 @@ import boto3
 from botocore.client import Config
 from botocore.exceptions import ClientError
 from collections import defaultdict
+from typing import Callable, Tuple
 
 # =========================
 # Logging configuration
@@ -80,7 +43,7 @@ class IcebergBatchProcessor:
         self.warehouse_path = os.getenv("WAREHOUSE_PATH", "warehouse")
 
         # Batch settings
-        self.batch_size = int(os.getenv("BATCH_SIZE", "100"))
+        self.batch_size = int(os.getenv("BATCH_SIZE", "500"))
         self.batch_timeout = int(os.getenv("BATCH_TIMEOUT", "30"))
         self.init_batch_size = int(os.getenv("INIT_BATCH_SIZE", "1000"))
 
@@ -90,6 +53,8 @@ class IcebergBatchProcessor:
         # Batch buffer for general-purpose batching (not used for stream per-record)
         self.batch_buffer = defaultdict(list)
         self.batch_timestamps = {}
+        self.init_in_progress = set()
+
 
         # Cache
         self.schema_cache = {}
@@ -107,6 +72,7 @@ class IcebergBatchProcessor:
         # Setup S3 Client
         self.s3_client = self.setup_s3_client()
         self.ensure_bucket_exists(self.warehouse_path)
+        self.is_init_mode = True
 
     # =========================
     # S3 helpers
@@ -367,7 +333,7 @@ class IcebergBatchProcessor:
     # Record helpers
     # =========================
     def generate_record_id(self, data, table_name, database_name):
-        pk_fields = ['id', 'stt', 'ma_gd', 'ma_giao_dich', 'ma_kh']
+        pk_fields = ['stt']
         for field in pk_fields:
             if field in data and data[field] and str(data[field]).strip():
                 return f"{database_name}_{table_name}_{data[field]}"
@@ -420,13 +386,14 @@ class IcebergBatchProcessor:
         change_logs = []
         total_written = 0
 
-        # chunk into init_batch_size
-        for i in range(0, len(records), self.init_batch_size):
-            chunk = records[i:i + self.init_batch_size]
+        for i in range(0, len(records), self.batch_size):
+            chunk = records[i:i + self.batch_size]
             try:
                 df_chunk = pd.DataFrame(chunk).astype(str)
 
-                # If there is no existing table, we just write chunk as new table (append)
+                if 'deleted' not in df_chunk.columns:
+                    df_chunk['deleted'] = False
+
                 existing_table = self.read_existing_table(database, table)
                 if existing_table is not None:
                     df_existing = existing_table.to_pandas().astype(str)
@@ -440,7 +407,6 @@ class IcebergBatchProcessor:
                 else:
                     df_combined = df_chunk
 
-                # schema
                 arrow_schema = self.df_to_arrow_schema(df_combined)
                 schema_changed = False
                 metadata = self.load_table_metadata(database, table)
@@ -448,8 +414,19 @@ class IcebergBatchProcessor:
                     self.add_schema_to_metadata(metadata, arrow_schema)
                     schema_changed = True
 
-                # write data (overwrite single file)
                 import io
+
+                for col in ['deleted']:
+                    if col in df_combined.columns:
+                        if col in arrow_schema.names:
+                            field_type = arrow_schema.field(col).type
+                            if pa.types.is_string(field_type):
+                                df_combined[col] = df_combined[col].astype(str)
+                            elif pa.types.is_boolean(field_type):
+                                df_combined[col] = df_combined[col].astype(bool)
+                        else:
+                            df_combined[col] = df_combined[col].astype(bool)
+
                 arrow_table = pa.Table.from_pandas(df_combined, schema=arrow_schema)
                 buf = io.BytesIO()
                 pq.write_table(arrow_table, buf, compression='snappy')
@@ -512,19 +489,18 @@ class IcebergBatchProcessor:
     def process_stream_record(self, table_key, record):
         database, table = table_key.split('.')
         errors = []
+        before, after = None, None
+
         try:
             op = str(record.get('_operation', 'INSERT')).upper()
             rec_id = record.get('_record_id')
 
-            # load existing
             existing_table = self.read_existing_table(database, table)
             if existing_table is not None:
                 df_existing = existing_table.to_pandas().astype(str)
             else:
-                # no data -> empty df
                 df_existing = pd.DataFrame()
 
-            # ensure _record_id column
             if '_record_id' not in df_existing.columns:
                 df_existing['_record_id'] = ''
 
@@ -548,33 +524,38 @@ class IcebergBatchProcessor:
 
             if op == 'DELETE':
                 if rec_id in df_existing.index:
-                    df_existing = df_existing.drop(rec_id)
-                    after = None
+                    df_existing.at[rec_id, 'deleted'] = True
+                    df_existing.at[rec_id, '_operation'] = "DELETE"
+                    after = df_existing.loc[rec_id].to_dict()
                 else:
-                    # delete on missing row -> no-op (but log)
                     after = None
-            elif rec_id in df_existing.index:
-                # update: overwrite columns present in new
-                for col in df_new.columns:
-                    df_existing.at[rec_id, col] = df_new.at[rec_id, col]
-                after = df_existing.loc[rec_id].to_dict()
-            else:
-                # insert
-                df_existing = pd.concat([df_existing, df_new.loc[[rec_id]]])
+
+            elif op == 'UPDATE':
+                if rec_id in df_existing.index:
+                    for col in df_new.columns:
+                        if col not in ('_record_id', 'deleted'): 
+                            df_existing.at[rec_id, col] = df_new.at[rec_id, col]
+                    after = df_existing.loc[rec_id].to_dict()
+                else:
+                    # insert mới
+                    df_new['deleted'] = False
+                    df_existing = pd.concat([df_existing, df_new])
+                    after = df_new.loc[rec_id].to_dict()
+
+            elif op == 'INSERT':
+                df_new['deleted'] = False
+                df_existing = pd.concat([df_existing, df_new])
                 after = df_new.loc[rec_id].to_dict()
 
             df_combined = df_existing.reset_index(drop=True).fillna('').astype(str)
 
-            # schema detection
             arrow_schema = self.df_to_arrow_schema(df_combined)
             metadata = self.load_table_metadata(database, table)
             schema_changed = False
             if metadata['current-schema-id'] == -1:
-                # first-time schema
                 self.add_schema_to_metadata(metadata, arrow_schema)
                 schema_changed = True
 
-            # if schema fields different from last schema, add schema and mark
             cached_schema_names = set(self.schema_cache.get(table_key, []).names) if table_key in self.schema_cache else set()
             current_schema_names = set(df_combined.columns)
             if table_key not in self.schema_cache or cached_schema_names != current_schema_names:
@@ -582,7 +563,6 @@ class IcebergBatchProcessor:
                 self.schema_cache[table_key] = pa.schema([(c, pa.string()) for c in sorted(current_schema_names)])
                 self.add_schema_to_metadata(metadata, arrow_schema)
 
-            # write data (atomic)
             import io
             arrow_table = pa.Table.from_pandas(df_combined, schema=self.schema_cache[table_key])
             buf = io.BytesIO()
@@ -592,7 +572,6 @@ class IcebergBatchProcessor:
             data_key = self.atomic_write_data_file(database, table, bytes_data)
             file_size = len(bytes_data)
 
-            # change log entry
             change_entry = {
                 'record_id': rec_id,
                 'operation': op,
@@ -602,7 +581,6 @@ class IcebergBatchProcessor:
             }
             change_log_path = self.write_change_log(database, table, [change_entry])
 
-            # manifest & snapshot
             op_summary = {
                 'batch_size': 1,
                 'inserts': 1 if op == 'INSERT' else 0,
@@ -628,22 +606,22 @@ class IcebergBatchProcessor:
             self.write_error_log(database, table, [err])
             errors.append(err)
         return errors
-
+    
     # =========================
     # Kafka consumer
     # =========================
     def connect_kafka(self):
         try:
             self.consumer = KafkaConsumer(
-                "postgres-mcc-changes",
-                "mssql-mpass-changes",
                 bootstrap_servers=self.kafka_servers.split(","),
                 value_deserializer=lambda m: json.loads(m.decode("utf-8")),
                 auto_offset_reset="earliest",
                 enable_auto_commit=True,
-                group_id="iceberg-batch-processor-group",
+                group_id="iceberg-batch-processor-group"
             )
-            logger.info("✓ Connected to Kafka")
+            # Subscribe tất cả các topic bằng regex
+            self.consumer.subscribe(pattern=".*")  # .* sẽ bắt tất cả topic
+            logger.info("✓ Connected to Kafka, subscribed to all topics")
         except KafkaError as e:
             logger.error(f"Kafka error: {e}")
             raise
@@ -661,44 +639,44 @@ class IcebergBatchProcessor:
         self.connect_kafka()
         logger.info("🚀 Processor started (init-batch + stream-per-record)")
 
-        # Maintain an init buffer per table until init load done
         init_buffers = defaultdict(list)
-
+        
         for message in self.consumer:
             try:
                 self.record_count += 1
                 record = message.value
                 transformed, table_name, database_name, operation = self.transform_record(record)
+                
                 if not transformed or not table_name or not database_name:
                     logger.warning(f"[{self.record_count}] Failed to transform record")
                     continue
-
+                
                 table_key = f"{database_name}.{table_name}"
 
-                # If table not init-loaded yet (no data file), buffer for init; otherwise stream-process
                 if table_key not in self.init_loaded_tables:
-                    # check if data exists on S3; if exists mark init_loaded
                     if self.read_existing_table(database_name, table_name) is not None:
                         self.init_loaded_tables.add(table_key)
                         logger.info(f"Detected existing data for {table_key}, switching to stream mode")
 
-                if table_key not in self.init_loaded_tables:
-                    # buffer for initial load
-                    init_buffers[table_key].append(transformed)
-                    logger.info(f"[{self.record_count}] Buffered for INIT: {table_key} | {len(init_buffers[table_key])} records")
 
-                    # if buffered reaches init_batch_size -> process init batches
-                    if len(init_buffers[table_key]) >= self.init_batch_size:
-                        total = self.process_init_batches(table_key, init_buffers[table_key])
-                        logger.info(f"Init load completed chunk for {table_key} -> {total} records written")
-                        init_buffers[table_key] = []
+                    else:
+                        init_buffers[table_key].append(transformed)
+                        logger.info(f"[{self.record_count}] Buffered for INIT: {table_key} | {len(init_buffers[table_key])} records")
 
-                else:
-                    # streaming per-record
-                    self.process_stream_record(table_key, transformed)
+
+                        if len(init_buffers[table_key]) >= self.init_batch_size:
+                            total = self.process_init_batches(table_key, init_buffers[table_key])
+                            logger.info(f"Init load completed chunk for {table_key} -> {total} records written")
+                            init_buffers[table_key] = []
+                        continue  
+
+                if operation in ("INSERT", "UPDATE", "DELETE"):
+                        self.process_stream_record(table_key, transformed)
+
 
             except Exception as e:
                 logger.exception(f"Processing loop error: {e}")
+
 
     # Optional: wait_for_services (same as previous)
     def wait_for_services(self):

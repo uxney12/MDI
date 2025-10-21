@@ -178,7 +178,7 @@ services:
       
       # Batch Settings - QUAN TRỌNG!
       # Metadata được tạo mỗi khi flush batch, không phải mỗi record
-      BATCH_SIZE: 100            # Số records per batch (default: 100)
+      BATCH_SIZE: 500            # Số records per batch (default: 100)
       BATCH_TIMEOUT: 30          # Timeout (giây) để auto-flush batch (default: 30)
       
       # AWS credentials for boto3
