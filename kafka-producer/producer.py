@@ -92,74 +92,65 @@ class UnifiedKafkaProducer:
 
     def _apply_ddl_to_snapshots(self, payload):
         op = payload.get("operation")
-        db = payload.get("database", self.pg_config['database'])
-        src = payload.get("source", "postgresql")
+        src = payload.get("source", "postgresql").lower()
+        db = payload.get("database")
 
-        # chỉ xử lý cho database hiện tại
-        if db != self.pg_config['database']:
+        if src == "postgresql":
+            table_schemas = self.pg_table_schemas
+            table_snapshots = self.pg_table_snapshots
+            schema_versions = self.pg_table_schema_versions
+        elif src == "mssql":
+            table_schemas = self.mssql_table_schemas
+            table_snapshots = self.mssql_table_snapshots
+            schema_versions = self.mssql_table_schema_versions
+        else:
             return
-
-        # tất cả table keys ở hiện tại dùng dạng "schema.table"
-        # payload["table"] có thể là "schema.table" hoặc "table" tùy chỗ. Chuẩn hóa:
-        tbl = payload.get("table")
-        if not tbl:
-            # với RENAME_TABLE payload dùng old_table/new_table
-            tbl = None
 
         with self.lock:
             try:
                 if op == "ADD_TABLE":
-                    full_table = payload['table']  # nên là "schema.table"
-                    # tạo schema entry và snapshot rỗng
-                    self.pg_table_schemas.setdefault(full_table, payload.get("columns", {}))
-                    self.pg_table_snapshots.setdefault(full_table, {})
-                    self.pg_table_schema_versions[full_table] = self.pg_table_schema_versions.get(full_table, 0) + 1
+                    full_table = payload['table']
+                    table_schemas.setdefault(full_table, payload.get("columns", {}))
+                    table_snapshots.setdefault(full_table, {})
+                    schema_versions[full_table] = schema_versions.get(full_table, 0) + 1
 
                 elif op == "DROP_TABLE":
                     full_table = payload['table']
-                    self.pg_table_schemas.pop(full_table, None)
-                    self.pg_table_snapshots.pop(full_table, None)
-                    self.pg_table_schema_versions.pop(full_table, None)
+                    table_schemas.pop(full_table, None)
+                    table_snapshots.pop(full_table, None)
+                    schema_versions.pop(full_table, None)
 
                 elif op == "RENAME_TABLE":
                     old = payload['old_table']
                     new = payload['new_table']
-                    # di chuyển schema
-                    if old in self.pg_table_schemas:
-                        self.pg_table_schemas[new] = self.pg_table_schemas.pop(old)
-                    # di chuyển snapshots
-                    if old in self.pg_table_snapshots:
-                        self.pg_table_snapshots[new] = self.pg_table_snapshots.pop(old)
-                    # versions
-                    if old in self.pg_table_schema_versions:
-                        self.pg_table_schema_versions[new] = self.pg_table_schema_versions.pop(old)
+                    if old in table_schemas:
+                        table_schemas[new] = table_schemas.pop(old)
+                    if old in table_snapshots:
+                        table_snapshots[new] = table_snapshots.pop(old)
+                    if old in schema_versions:
+                        schema_versions[new] = schema_versions.pop(old)
 
                 elif op == "ADD_COLUMN":
                     full_table = payload['table']
                     col = payload['column']
                     dtype = payload.get('data_type')
                     default = payload.get('default', None)
-                    # update schema info
-                    cols = self.pg_table_schemas.setdefault(full_table, {})
+                    cols = table_schemas.setdefault(full_table, {})
                     cols[col] = dtype
-                    self.pg_table_schema_versions[full_table] = self.pg_table_schema_versions.get(full_table, 0) + 1
+                    schema_versions[full_table] = schema_versions.get(full_table, 0) + 1
 
-                    # update snapshots: thêm key cho mỗi row với default value
-                    snaps = self.pg_table_snapshots.get(full_table, {})
+                    snaps = table_snapshots.get(full_table, {})
                     for rid, row in snaps.items():
-                        # nếu default có kiểu PostgreSQL expression, bạn có thể parse/convert ở đây; tạm set default trực tiếp
-                        row[col] = default
+                        row.setdefault(col, default)
 
                 elif op == "DROP_COLUMN":
                     full_table = payload['table']
                     col = payload['column']
-                    # update schema
-                    cols = self.pg_table_schemas.get(full_table, {})
+                    cols = table_schemas.get(full_table, {})
                     if col in cols:
                         cols.pop(col, None)
-                        self.pg_table_schema_versions[full_table] = self.pg_table_schema_versions.get(full_table, 0) + 1
-                    # update snapshots: remove key
-                    snaps = self.pg_table_snapshots.get(full_table, {})
+                        schema_versions[full_table] = schema_versions.get(full_table, 0) + 1
+                    snaps = table_snapshots.get(full_table, {})
                     for rid, row in snaps.items():
                         if col in row:
                             row.pop(col, None)
@@ -168,46 +159,51 @@ class UnifiedKafkaProducer:
                     full_table = payload['table']
                     old_col = payload['old_column']
                     new_col = payload['new_column']
-                    # schema: rename key and preserve data_type
-                    cols = self.pg_table_schemas.get(full_table, {})
+                    cols = table_schemas.get(full_table, {})
                     if old_col in cols:
                         dtype = cols.pop(old_col)
                         cols[new_col] = dtype
-                        self.pg_table_schema_versions[full_table] = self.pg_table_schema_versions.get(full_table, 0) + 1
+                        schema_versions[full_table] = schema_versions.get(full_table, 0) + 1
 
-                    # snapshots: rename key in each row dict
-                    snaps = self.pg_table_snapshots.get(full_table, {})
+                    snaps = table_snapshots.get(full_table, {})
                     for rid, row in snaps.items():
                         if old_col in row:
                             row[new_col] = row.pop(old_col)
                         else:
-                            # nếu row không có old_col, đảm bảo new_col tồn tại (None)
                             row.setdefault(new_col, None)
 
-                # nếu cần, bạn có thể set một flag để downstream biết schema vừa thay đổi
-                # nhưng vì chúng ta đã cập nhật snapshot, không cần skip poll_rows
                 return
             except Exception:
                 logger.exception("Error applying DDL to snapshots")
                 return
 
 
+
     def _send_ddl_payload(self, payload):
-        topic = f"{self.pg_config['database']}-ddl-topic"
+        """
+        Gửi DDL payload lên Kafka và cập nhật snapshot nội bộ.
+        Hỗ trợ cả PostgreSQL và MSSQL.
+        """
+        source = payload.get("source", "postgresql").lower()
+
+        if source == "postgresql":
+            topic = f"{self.pg_config['database']}-ddl-topic"
+        elif source == "mssql":
+            topic = f"{self.mssql_config['database']}-ddl-topic"
+        else:
+            topic = "unknown-ddl-topic"
+
         try:
             self.producer.send(topic, value=payload)
-            logger.info(f"PostgreSQL DDL topic: {topic}")
-            logger.info(f"PostgreSQL DDL payload: {payload}")
+            logger.info(f"[DDL] Sent payload from {source.upper()} → topic: {topic}")
+            logger.info(f"[DDL] Payload: {payload}")
         except Exception:
-            logger.exception("Failed to send DDL payload")
+            logger.exception(f"Failed to send {source.upper()} DDL payload to Kafka")
         finally:
-            if payload.get("source") == "postgresql":
-                try:
-                    self._apply_ddl_to_snapshots(payload)
-                except Exception:
-                    logger.exception("Failed to apply DDL to snapshots")
-
-
+            try:
+                self._apply_ddl_to_snapshots(payload)
+            except Exception:
+                logger.exception(f"Failed to apply {source.upper()} DDL to local snapshots")
 
 
     # ---------------- PostgreSQL ----------------
@@ -253,7 +249,6 @@ class UnifiedKafkaProducer:
                 self.pg_table_schema_versions[table_full] = 0
                 self.pg_schema_changed[table_full] = False
 
-                # data fetch
                 cursor.execute(f'SELECT * FROM "{schema}"."{table}";')
                 columns = [desc[0] for desc in cursor.description]
                 rows = cursor.fetchall()
@@ -319,7 +314,6 @@ class UnifiedKafkaProducer:
                     schema, table = table_full.split(".")
                     topic = f"{self.pg_config['database']}-{table}-topic"
 
-                    # Fetch all data
                     cursor.execute(f'SELECT * FROM "{schema}"."{table}";')
                     columns = [desc[0] for desc in cursor.description]
                     rows = cursor.fetchall()
@@ -335,18 +329,15 @@ class UnifiedKafkaProducer:
                         old_row = last_snapshot.get(row_id)
                         if not old_row:
                             op = "INSERT"
-                        # so sánh trên intersection columns để tránh false-positive do cột mới/đổi tên
                         if old_row is None:
                             op = "INSERT"
                         else:
-                            # columns chung
                             common_cols = set(old_row.keys()) & set(row_dict.keys())
                             changed = any(old_row.get(c) != row_dict.get(c) for c in common_cols)
                             if changed:
                                 op = "UPDATE"
                             else:
                                 continue
-
 
                         payload = {
                             "operation": op,
@@ -361,7 +352,6 @@ class UnifiedKafkaProducer:
                             self.message_count += 1
                             logger.info(f"[{self.message_count}] PostgreSQL {op}: {payload}")
 
-                    # Detect deleted rows
                     deleted_ids = set(last_snapshot.keys()) - set(current_snapshot.keys())
                     for record_id in deleted_ids:
                         payload = {
@@ -377,7 +367,6 @@ class UnifiedKafkaProducer:
                             self.message_count += 1
                             logger.info(f"[{self.message_count}] PostgreSQL DELETE: {payload}")
 
-                    # Update snapshot
                     self.pg_table_snapshots[table_full] = current_snapshot
 
                 cursor.close()
@@ -390,7 +379,6 @@ class UnifiedKafkaProducer:
 
 
     def load_pg_schema_state(self):
-        """Trả về map {schema.table: {column: {data_type, column_default}}} cho toàn bộ PostgreSQL."""
         if not self.pg_connection or self.pg_connection.closed:
             self.connect_postgres()
 
@@ -422,7 +410,7 @@ class UnifiedKafkaProducer:
     def postgres_poll_ddl(self):
         logger.info("Starting PostgreSQL DDL polling loop...")
 
-        ddl_state = self.load_pg_schema_state()  # snapshot ban đầu
+        ddl_state = self.load_pg_schema_state()  
 
         while True:
             try:
@@ -484,7 +472,6 @@ class UnifiedKafkaProducer:
                     for dropped in list(dropped_cols):
                         for added in list(added_cols):
                             if old_cols[dropped]["data_type"] == new_cols[added]["data_type"]:
-                                # nếu có cùng default hoặc cả 2 đều null thì càng chắc chắn
                                 old_def = old_cols[dropped].get("column_default")
                                 new_def = new_cols[added].get("column_default")
                                 if old_def == new_def or (old_def is None and new_def is None):
@@ -601,7 +588,6 @@ class UnifiedKafkaProducer:
                 topic = f"{self.mssql_config['database']}-{table}-topic"
                 logger.info(f"🚀 Starting initial load: MSSQL.{table_full}")
 
-                # schema fetch for this table
                 cursor.execute("""
                     SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS
                     WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s
@@ -613,7 +599,6 @@ class UnifiedKafkaProducer:
                 self.mssql_table_schema_versions[table_full] = 0
                 self.mssql_schema_changed[table_full] = False
 
-                # data fetch
                 cursor.execute(f"SELECT * FROM [{schema}].[{table}];")
                 rows = cursor.fetchall()
                 total = len(rows)
@@ -656,7 +641,6 @@ class UnifiedKafkaProducer:
             return
         logger.info("Starting MSSQL ROW polling...")
 
-        # Ensure initial snapshots exist
         self.mssql_initial_load()
         poll_interval = int(os.getenv('MSSQL_POLL_INTERVAL', 10))
 
@@ -666,7 +650,6 @@ class UnifiedKafkaProducer:
                     self.connect_mssql()
                 cursor = self.mssql_connection.cursor(as_dict=True)
 
-                # Get all user tables
                 cursor.execute("""
                     SELECT TABLE_SCHEMA, TABLE_NAME
                     FROM INFORMATION_SCHEMA.TABLES
@@ -679,7 +662,6 @@ class UnifiedKafkaProducer:
                     schema, table = table_full.split(".")
                     topic = f"{self.mssql_config['database']}-{table}-topic"
 
-                    # Fetch all data
                     cursor.execute(f'SELECT * FROM [{schema}].[{table}]')
                     rows = cursor.fetchall()
                     columns = rows[0].keys() if rows else []
@@ -691,12 +673,17 @@ class UnifiedKafkaProducer:
                         row_id = row.get("stt") or hashlib.md5(json.dumps(row, sort_keys=True).encode()).hexdigest()
                         current_snapshot[row_id] = row
                         old_row = last_snapshot.get(row_id)
+
                         if not old_row:
                             op = "INSERT"
-                        elif old_row != row:
-                            op = "UPDATE"
                         else:
-                            continue
+                            common_cols = set(old_row.keys()) & set(row.keys())
+                            changed = any(old_row.get(c) != row.get(c) for c in common_cols)
+                            if changed:
+                                op = "UPDATE"
+                            else:
+                                continue
+
 
                         payload = {
                             "operation": op,
@@ -727,7 +714,6 @@ class UnifiedKafkaProducer:
                             self.message_count += 1
                             logger.info(f"[{self.message_count}] MSSQL DELETE: {payload}")
 
-                    # Update snapshot
                     self.mssql_table_snapshots[table_full] = current_snapshot
 
                 cursor.close()
@@ -737,125 +723,157 @@ class UnifiedKafkaProducer:
                 logger.exception("Error polling MSSQL ROWS")
                 time.sleep(5)
 
-    # ---------------- MSSQL Poll - DDL (table/column add, modify, delete) ----------------
+    def load_mssql_schema_state(self):
+        conn = self._open_mssql_conn_with_retry()
+        cursor = conn.cursor(as_dict=True)
+        cursor.execute("""
+            SELECT 
+                TABLE_SCHEMA AS table_schema,
+                TABLE_NAME AS table_name,
+                COLUMN_NAME AS column_name,
+                DATA_TYPE AS data_type,
+                COLUMN_DEFAULT AS column_default
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA NOT IN ('sys', 'INFORMATION_SCHEMA')
+            ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION;
+        """)
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+
+        schema_state = {}
+        for r in rows:
+            schema = r["table_schema"]
+            table = r["table_name"]
+            col = r["column_name"]
+            dtype = r["data_type"]
+            default = r["column_default"]
+            full_table = f"{schema}.{table}"
+
+            if full_table not in schema_state:
+                schema_state[full_table] = {}
+            schema_state[full_table][col] = {
+                "data_type": dtype,
+                "column_default": default
+            }
+
+        return schema_state
+
+
+
     def mssql_poll_ddl(self):
-        """Poll MSSQL for DDL changes (add/drop/alter table/columns)."""
+        """Phát hiện thay đổi DDL trong MSSQL (giống logic của PostgreSQL DDL polling)."""
         if not self.enable_mssql:
             return
-        logger.info("Starting MSSQL DDL polling...")
-        poll_interval = int(os.getenv('MSSQL_DDL_POLL_INTERVAL', 30))
+        logger.info("Starting MSSQL DDL polling loop...")
+
+        ddl_state = self.load_mssql_schema_state() 
+        poll_interval = int(os.getenv("MSSQL_DDL_POLL_INTERVAL", 10))
 
         while True:
-            conn = None
-            cursor = None
             try:
-                conn = self._open_mssql_conn_with_retry(retries=3)
-                cursor = conn.cursor(as_dict=True)
+                time.sleep(poll_interval)
+                new_state = self.load_mssql_schema_state()
 
-                try:
-                    q = """
-                        SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE
-                        FROM INFORMATION_SCHEMA.COLUMNS
-                        WHERE TABLE_SCHEMA NOT IN ('sys', 'INFORMATION_SCHEMA')
-                        ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION;
-                    """
-                    cursor.execute(q)
-                    rows = cursor.fetchall()
-                except Exception:
-                    logger.exception("Failed to fetch INFORMATION_SCHEMA.COLUMNS for DDL polling")
-                    rows = []
-
-                current_schema_map = {}
-                for r in rows:
-                    full_table = f"{r['TABLE_SCHEMA']}.{r['TABLE_NAME']}"
-                    current_schema_map.setdefault(full_table, {})[r['COLUMN_NAME']] = r['DATA_TYPE']
-
-                old_tables = set(self.mssql_table_schemas.keys())
-                new_tables = set(current_schema_map.keys())
+                old_tables = set(ddl_state.keys())
+                new_tables = set(new_state.keys())
 
                 added_tables = new_tables - old_tables
-                dropped_tables = old_tables - new_tables
-
                 for tbl in added_tables:
                     payload = {
-                        "operation": "CREATE_TABLE",
+                        "operation": "ADD_TABLE",
                         "database": self.mssql_config["database"],
-                        "source": "mssql",
-                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
                         "table": tbl,
-                        "columns": current_schema_map[tbl]
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "columns": new_state[tbl],
+                        "source": "mssql"
                     }
-                    topic = f"{self.mssql_config['database']}-ddl-topic"
                     self._send_ddl_payload(payload)
 
+                dropped_tables = old_tables - new_tables
                 for tbl in dropped_tables:
                     payload = {
                         "operation": "DROP_TABLE",
                         "database": self.mssql_config["database"],
-                        "source": "mssql",
+                        "table": tbl,
                         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                        "table": tbl
+                        "source": "mssql"
                     }
-                    topic = f"{self.mssql_config['database']}-ddl-topic"
                     self._send_ddl_payload(payload)
 
+                for dropped in list(dropped_tables):
+                    for added in list(added_tables):
+                        if new_state[added] == ddl_state[dropped]:
+                            payload = {
+                                "operation": "RENAME_TABLE",
+                                "database": self.mssql_config["database"],
+                                "old_table": dropped,
+                                "new_table": added,
+                                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                                "source": "mssql"
+                            }
+                            self._send_ddl_payload(payload)
+                            dropped_tables.discard(dropped)
+                            added_tables.discard(added)
+                            break
+
                 for tbl in old_tables & new_tables:
-                    old_cols = self.mssql_table_schemas[tbl]
-                    new_cols = current_schema_map[tbl]
+                    old_cols = ddl_state[tbl]
+                    new_cols = new_state[tbl]
 
-                    added_cols = new_cols.keys() - old_cols.keys()
-                    dropped_cols = old_cols.keys() - new_cols.keys()
-                    modified_cols = {
-                        c for c in old_cols.keys() & new_cols.keys()
-                        if old_cols[c] != new_cols[c]
-                    }
+                    added_cols = set(new_cols.keys()) - set(old_cols.keys())
+                    dropped_cols = set(old_cols.keys()) - set(new_cols.keys())
 
-                    for c in added_cols:
+                    rename_pairs = []
+                    for dropped in list(dropped_cols):
+                        for added in list(added_cols):
+                            if old_cols[dropped]["data_type"] == new_cols[added]["data_type"]:
+                                rename_pairs.append((dropped, added))
+                                dropped_cols.discard(dropped)
+                                added_cols.discard(added)
+                                break
+
+                    for old_col, new_col in rename_pairs:
+                        payload = {
+                            "operation": "RENAME_COLUMN",
+                            "database": self.mssql_config["database"],
+                            "table": tbl,
+                            "old_column": old_col,
+                            "new_column": new_col,
+                            "data_type": new_cols[new_col]["data_type"],
+                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                            "source": "mssql"
+                        }
+                        self._send_ddl_payload(payload)
+
+                    for col in added_cols:
                         payload = {
                             "operation": "ADD_COLUMN",
                             "database": self.mssql_config["database"],
-                            "source": "mssql",
-                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
                             "table": tbl,
-                            "column": c,
-                            "data_type": new_cols[c]
+                            "column": col,
+                            "data_type": new_cols[col]["data_type"],
+                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                            "source": "mssql"
                         }
-                        topic = f"{self.mssql_config['database']}-ddl-topic"
                         self._send_ddl_payload(payload)
 
-                    for c in dropped_cols:
+                    for col in dropped_cols:
                         payload = {
                             "operation": "DROP_COLUMN",
                             "database": self.mssql_config["database"],
-                            "source": "mssql",
-                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
                             "table": tbl,
-                            "column": c
+                            "column": col,
+                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                            "source": "mssql"
                         }
-                        topic = f"{self.mssql_config['database']}-ddl-topic"
                         self._send_ddl_payload(payload)
 
-                    for c in modified_cols:
-                        payload = {
-                            "operation": "ALTER_COLUMN",
-                            "database": self.mssql_config["database"],
-                            "source": "mssql",
-                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                            "table": tbl,
-                            "column": c,
-                            "old_type": old_cols[c],
-                            "new_type": new_cols[c]
-                        }
-                        topic = f"{self.mssql_config['database']}-ddl-topic"
-                        self._send_ddl_payload(payload)
-
-                self.mssql_table_schemas = current_schema_map
-                cursor.close()
-                time.sleep(poll_interval)
+                ddl_state = new_state
 
             except Exception:
                 logger.exception("Error polling MSSQL DDL")
-                time.sleep(10)
+                time.sleep(5)
 
     
     # ---------------- Shutdown ----------------
@@ -893,7 +911,6 @@ class UnifiedKafkaProducer:
                     for table_full, snapshot in initial_snapshots.items():
                         self.pg_table_snapshots[table_full] = snapshot
 
-                # Thread 1: Poll rows (INSERT/UPDATE/DELETE)
                 t1 = threading.Thread(target=self.postgres_poll_rows, daemon=True)
                 t1.start()
                 threads.append(t1)

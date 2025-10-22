@@ -111,7 +111,8 @@ class IcebergBatchProcessor:
         return f"{self.get_table_base_path(database, table)}/metadata"
 
     def get_data_path(self, database, table):
-
+        return f"{self.get_table_base_path(database, table)}/data"
+        
     def get_data_file_key(self, database, table):
         return f"{self.get_data_path(database, table)}/{table}.parquet"
 
