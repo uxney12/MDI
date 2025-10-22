@@ -32,7 +32,6 @@ logger = logging.getLogger("IcebergBatchProcessor")
 # =========================
 class IcebergBatchProcessor:
     def __init__(self):
-        # Kafka + Flink
         self.kafka_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
         self.flink_host = os.getenv("FLINK_JOBMANAGER_HOST", "jobmanager")
         self.flink_port = os.getenv("FLINK_JOBMANAGER_PORT", "8081")
@@ -43,7 +42,6 @@ class IcebergBatchProcessor:
         self.s3_secret_key = os.getenv("S3_SECRET_KEY", "password123")
         self.warehouse_path = os.getenv("WAREHOUSE_PATH", "warehouse")
 
-        # Batch settings
         self.batch_size = int(os.getenv("BATCH_SIZE", "500"))
         self.batch_timeout = int(os.getenv("BATCH_TIMEOUT", "30"))
         self.init_batch_size = int(os.getenv("INIT_BATCH_SIZE", "1000"))
@@ -51,16 +49,13 @@ class IcebergBatchProcessor:
         self.consumer = None
         self.record_count = 0
 
-        # Batch buffer for general-purpose batching (not used for stream per-record)
         self.batch_buffer = defaultdict(list)
         self.batch_timestamps = {}
         self.init_in_progress = set()
 
 
-        # Cache
         self.schema_cache = {}
         self.table_metadata_cache = {}
-        # track tables that already finished init load
         self.init_loaded_tables = set()
 
         logger.info("=== Iceberg Batch Processor (single file, init-batch + stream-per-record) ===")
@@ -116,10 +111,8 @@ class IcebergBatchProcessor:
         return f"{self.get_table_base_path(database, table)}/metadata"
 
     def get_data_path(self, database, table):
-        return f"{self.get_table_base_path(database, table)}/data"
 
     def get_data_file_key(self, database, table):
-        # single data file per table
         return f"{self.get_data_path(database, table)}/{table}.parquet"
 
     # =========================
@@ -140,7 +133,6 @@ class IcebergBatchProcessor:
             self.table_metadata_cache[table_key] = metadata
             return metadata
         except ClientError:
-            # not found -> new
             metadata = self.create_new_table_metadata(database, table)
             self.table_metadata_cache[table_key] = metadata
             return metadata
@@ -199,19 +191,25 @@ class IcebergBatchProcessor:
         metadata['current-schema-id'] = schema_id
         metadata['last-column-id'] = last_column_id
         return schema_id
+    
+    # =========================
+    # Helper: normalize db/table names
+    # =========================
+    def normalize_db_table(self, database: str, table: str) -> Tuple[str,str]:
 
-    # =========================
-    # Utility: atomic write of data file using temp + copy
-    # =========================
+        if table is None:
+            return database, table
+        parts = table.split('.')
+        normalized_table = parts[-1].strip().lower()
+        normalized_db = database.strip() if database else database
+        return normalized_db, normalized_table
+
     def atomic_write_data_file(self, database, table, bytes_data):
         final_key = self.get_data_file_key(database, table)
         temp_key = f"{self.get_data_path(database, table)}/._tmp_{uuid.uuid4().hex}.parquet"
-        # upload temp
         self.s3_client.put_object(Bucket=self.warehouse_path, Key=temp_key, Body=bytes_data)
-        # copy temp -> final (overwrite)
         copy_source = {'Bucket': self.warehouse_path, 'Key': temp_key}
         self.s3_client.copy_object(Bucket=self.warehouse_path, CopySource=copy_source, Key=final_key)
-        # delete temp
         self.s3_client.delete_object(Bucket=self.warehouse_path, Key=temp_key)
         return final_key
 
@@ -242,20 +240,80 @@ class IcebergBatchProcessor:
             logger.error(f"Error reading existing table {database}.{table}: {e}")
             return None
         
+    def commit_snapshot_and_logs(self, database, table, metadata, data_key, df_combined, change_entries, operation_summary, change_type='ddl'):
+        try:
+            change_log_path = None
+            if change_entries:
+                change_log_path = self.write_change_log(database, table, change_entries)
+
+            file_size = 0
+            try:
+                resp = self.s3_client.head_object(Bucket=self.warehouse_path, Key=data_key)
+                file_size = int(resp.get('ContentLength', 0))
+            except Exception:
+                file_size = operation_summary.get('file_size', 0)
+
+            manifest_path = self.create_manifest_file(database, table, data_key, len(df_combined), file_size, operation_summary)
+
+            manifest_list_path = self.create_manifest_list(database, table, [manifest_path], len(df_combined))
+
+            snapshot_id = self.create_snapshot(metadata, manifest_list_path, operation_summary, change_log_path=change_log_path, change_type=change_type)
+
+            self.save_metadata(database, table, metadata)
+
+            logger.info(f"✓ Committed snapshot {snapshot_id} for {database}.{table} (change_type={change_type})")
+            return {
+                "change_log": change_log_path,
+                "manifest": manifest_path,
+                "manifest_list": manifest_list_path,
+                "snapshot_id": snapshot_id
+            }
+        except Exception as e:
+            logger.exception(f"Commit error for {database}.{table}: {e}")
+            try:
+                self.save_metadata(database, table, metadata)
+            except Exception:
+                pass
+            raise
+
     def _write_back_table_with_schema(self, database, table, df):
         arrow_schema = self.df_to_arrow_schema(df)
+        df = df[sorted(df.columns.tolist())]
         arrow_table = pa.Table.from_pandas(df, schema=arrow_schema)
         buf = io.BytesIO()
         pq.write_table(arrow_table, buf, compression='snappy')
         buf.seek(0)
         data_bytes = buf.getvalue()
-        self.atomic_write_data_file(database, table, data_bytes)
+
+        data_key = self.atomic_write_data_file(database, table, data_bytes)
+        file_size = len(data_bytes)
+
         metadata = self.load_table_metadata(database, table)
-        self.add_schema_to_metadata(metadata, arrow_schema)
-        self.save_metadata(database, table, metadata)
+        schema_id = self.add_schema_to_metadata(metadata, arrow_schema)
+
+        change_entries = [{
+            "record_id": None,
+            "operation": "DDL",
+            "before": None,
+            "after": {"note": "ddl / schema write", "table": f"{database}.{table}", "schema_id": schema_id},
+            "processed_at": datetime.now().isoformat()
+        }]
+
+        op_summary = {
+            'batch_size': len(df),
+            'inserts': len(df),
+            'updates': 0,
+            'deletes': 0,
+            'total_records': len(df),
+            'file_size': file_size,
+            'primary_operation': 'ddl',
+            'duration_ms': 0
+        }
+
+        return self.commit_snapshot_and_logs(database, table, metadata, data_key, df, change_entries, op_summary, change_type='ddl')
+
 
     def _rename_table_in_s3(self, database, old_table, new_table):
-        """Move all keys under old_table → new_table in S3"""
         prefix_old = f"{database}/{old_table}/"
         prefix_new = f"{database}/{new_table}/"
         response = self.s3_client.list_objects_v2(Bucket=self.warehouse_path, Prefix=prefix_old)
@@ -461,7 +519,7 @@ class IcebergBatchProcessor:
                 data_key = self.atomic_write_data_file(database, table, bytes_data)
                 file_size = len(bytes_data)
 
-                batch_duration = 0  # small, not measured here
+                batch_duration = 0 
                 op_counts = {'INSERT': len(df_chunk), 'UPDATE': 0, 'DELETE': 0}
                 op_summary = {
                     'batch_size': len(df_chunk),
@@ -474,7 +532,6 @@ class IcebergBatchProcessor:
                     'duration_ms': batch_duration
                 }
 
-                # change log for batch: record-level entries
                 for r in chunk:
                     change_logs.append({
                         'record_id': r.get('_record_id'),
@@ -484,7 +541,6 @@ class IcebergBatchProcessor:
                         'processed_at': datetime.now().isoformat()
                     })
 
-                # persist change log and metadata
                 change_log_path = self.write_change_log(database, table, change_logs)
                 manifest_path = self.create_manifest_file(database, table, data_key, len(df_combined), file_size, op_summary)
                 manifest_list_path = self.create_manifest_list(database, table, [manifest_path], len(df_combined))
@@ -492,10 +548,8 @@ class IcebergBatchProcessor:
                 self.save_metadata(database, table, metadata)
 
                 total_written += len(df_chunk)
-                # after first successful write, mark init done
                 self.init_loaded_tables.add(table_key)
 
-                # clear chunk change logs to avoid duplication in next iteration
                 change_logs = []
 
             except Exception as e:
@@ -530,12 +584,10 @@ class IcebergBatchProcessor:
             if '_record_id' not in df_existing.columns:
                 df_existing['_record_id'] = ''
 
-            # normalize new row
             df_new = pd.DataFrame([record]).astype(str)
             if '_record_id' not in df_new.columns:
                 df_new['_record_id'] = rec_id
 
-            # compute merged columns
             all_columns = sorted(set(df_existing.columns) | set(df_new.columns))
             for c in all_columns:
                 if c not in df_existing.columns:
@@ -563,7 +615,6 @@ class IcebergBatchProcessor:
                             df_existing.at[rec_id, col] = df_new.at[rec_id, col]
                     after = df_existing.loc[rec_id].to_dict()
                 else:
-                    # insert mới
                     df_new['deleted'] = False
                     df_existing = pd.concat([df_existing, df_new])
                     after = df_new.loc[rec_id].to_dict()
@@ -639,15 +690,15 @@ class IcebergBatchProcessor:
     # =========================
     def process_ddl_event(self, payload):
         op = payload.get("operation", "").upper()
-        db = payload.get("database")
-        table = payload.get("table")
-        logger.info(f"Processing DDL event: {op} on {db}.{table}")
+        raw_db = payload.get("database")
+        raw_table = payload.get("table")
+        db, table = self.normalize_db_table(raw_db, raw_table)
+        logger.info(f"Processing DDL event: {op} on {raw_db}.{raw_table} -> normalized as {db}.{table}")
 
         if not db:
             logger.warning("DDL payload missing database")
             return
 
-        # 1️⃣ ADD_TABLE
         if op == "ADD_TABLE":
             if not table:
                 logger.warning("Missing table name in ADD_TABLE")
@@ -658,62 +709,79 @@ class IcebergBatchProcessor:
             self.add_schema_to_metadata(metadata, arrow_schema)
             self.save_metadata(db, table, metadata)
             logger.info(f"✓ Created empty table {db}.{table}")
+            return
 
-        # 2️⃣ DROP_TABLE  → rename {table}_deleted
-        elif op == "DROP_TABLE":
+        if op == "DROP_TABLE":
             if not table:
                 return
             new_table = f"{table}_deleted"
             logger.info(f"Renaming dropped table {table} → {new_table}")
             self._rename_table_in_s3(db, table, new_table)
+            return
 
-        # 3️⃣ RENAME_TABLE
-        elif op == "RENAME_TABLE":
+        if op == "RENAME_TABLE":
             old = payload.get("old_table")
             new = payload.get("new_table")
-            if not old or not new:
+            _, old_table = self.normalize_db_table(db, old) if old else (db, None)
+            _, new_table = self.normalize_db_table(db, new) if new else (db, None)
+            if not old_table or not new_table:
                 return
-            logger.info(f"Renaming table {old} → {new}")
-            self._rename_table_in_s3(db, old, new)
+            logger.info(f"Renaming table {old_table} → {new_table}")
+            self._rename_table_in_s3(db, old_table, new_table)
+            return
 
-        # 4️⃣ ADD_COLUMN
-        elif op == "ADD_COLUMN":
+        if op == "ADD_COLUMN":
             col = payload.get("column")
             default = payload.get("default", "")
             if not col:
+                logger.warning("ADD_COLUMN missing column name")
                 return
+
             existing_table = self.read_existing_table(db, table)
             if existing_table is None:
-                logger.warning(f"Table {db}.{table} not found for ADD_COLUMN")
+                logger.info(f"Table {db}.{table} not found for ADD_COLUMN — creating metadata and empty data file with column {col}")
+                metadata = self.load_table_metadata(db, table)  
+                df = pd.DataFrame(columns=[col])
+                if default is not None and default != "":
+                    df[col] = default
+                if 'deleted' not in df.columns:
+                    df['deleted'] = False
+                self._write_back_table_with_schema(db, table, df)
+                logger.info(f"✓ Added column {col} (default={default}) to newly created {db}.{table}")
                 return
+
             df = existing_table.to_pandas().astype(str)
             if col not in df.columns:
-                df[col] = default
+                df[col] = default if default is not None else ''
             self._write_back_table_with_schema(db, table, df)
             logger.info(f"✓ Added column {col} (default={default}) to {db}.{table}")
+            return
 
-        # 5️⃣ RENAME_COLUMN
-        elif op == "RENAME_COLUMN":
+        if op == "RENAME_COLUMN":
             old_col = payload.get("old_column")
             new_col = payload.get("new_column")
             if not old_col or not new_col:
+                logger.warning("RENAME_COLUMN missing old/new column")
                 return
             existing_table = self.read_existing_table(db, table)
             if existing_table is None:
+                logger.warning(f"Table {db}.{table} not found for RENAME_COLUMN")
                 return
             df = existing_table.to_pandas().astype(str)
             if old_col in df.columns:
                 df.rename(columns={old_col: new_col}, inplace=True)
                 self._write_back_table_with_schema(db, table, df)
                 logger.info(f"✓ Renamed column {old_col} → {new_col} in {db}.{table}")
+            return
 
-        # 6️⃣ DROP_COLUMN → rename {col}_deleted
-        elif op == "DROP_COLUMN":
+        if op == "DROP_COLUMN":
             col = payload.get("column")
             if not col:
+                logger.warning("DROP_COLUMN missing column")
                 return
             existing_table = self.read_existing_table(db, table)
             if existing_table is None:
+                logger.warning(f"Table {db}.{table} not found for DROP_COLUMN")
                 return
             df = existing_table.to_pandas().astype(str)
             if col in df.columns:
@@ -721,6 +789,10 @@ class IcebergBatchProcessor:
                 df.rename(columns={col: new_col}, inplace=True)
                 self._write_back_table_with_schema(db, table, df)
                 logger.info(f"✓ Renamed column {col} → {new_col} (DROP_COLUMN) in {db}.{table}")
+            return
+
+        logger.info(f"✅ Finished DDL: {op} on {db}.{table}")
+
 
     
     # =========================
@@ -735,8 +807,7 @@ class IcebergBatchProcessor:
                 enable_auto_commit=True,
                 group_id="iceberg-batch-processor-group"
             )
-            # Subscribe tất cả các topic bằng regex
-            self.consumer.subscribe(pattern=".*")  # .* sẽ bắt tất cả topic
+            self.consumer.subscribe(pattern=".*")  
             logger.info("✓ Connected to Kafka, subscribed to all topics")
         except KafkaError as e:
             logger.error(f"Kafka error: {e}")
@@ -760,24 +831,30 @@ class IcebergBatchProcessor:
             try:
                 self.record_count += 1
                 record = message.value
+
+                logger.info(f"[{self.record_count}] Topic: {message.topic}")
+                logger.info(f"[{self.record_count}] Raw payload: {json.dumps(record, ensure_ascii=False)}")
+
+                op = str(record.get("operation", "")).upper()
+                if op in ("ADD_TABLE", "DROP_TABLE", "RENAME_TABLE",
+                        "ADD_COLUMN", "DROP_COLUMN", "RENAME_COLUMN"):
+                    self.process_ddl_event(record)
+                    continue
+
                 transformed, table_name, database_name, operation = self.transform_record(record)
-                
                 if not transformed or not table_name or not database_name:
                     logger.warning(f"[{self.record_count}] Failed to transform record")
                     continue
-                
+
                 table_key = f"{database_name}.{table_name}"
 
                 if table_key not in self.init_loaded_tables:
                     if self.read_existing_table(database_name, table_name) is not None:
                         self.init_loaded_tables.add(table_key)
                         logger.info(f"Detected existing data for {table_key}, switching to stream mode")
-
-
                     else:
                         init_buffers[table_key].append(transformed)
                         logger.info(f"[{self.record_count}] Buffered for INIT: {table_key} | {len(init_buffers[table_key])} records")
-
 
                         if len(init_buffers[table_key]) >= self.init_batch_size:
                             total = self.process_init_batches(table_key, init_buffers[table_key])
@@ -785,16 +862,12 @@ class IcebergBatchProcessor:
                             init_buffers[table_key] = []
                         continue  
 
-                if operation in ("ADD_TABLE", "DROP_TABLE", "RENAME_TABLE", "ADD_COLUMN", "DROP_COLUMN", "RENAME_COLUMN"):
-                    self.process_ddl_event(record)
-                    continue
-
                 if operation in ("INSERT", "UPDATE", "DELETE"):
-                        self.process_stream_record(table_key, transformed)
-
+                    self.process_stream_record(table_key, transformed)
 
             except Exception as e:
                 logger.exception(f"Processing loop error: {e}")
+
 
 
     def wait_for_services(self):

@@ -89,6 +89,127 @@ class UnifiedKafkaProducer:
                 backoff = min(backoff * 2, 30)
         raise Exception("Failed to connect to Kafka")
 
+
+    def _apply_ddl_to_snapshots(self, payload):
+        op = payload.get("operation")
+        db = payload.get("database", self.pg_config['database'])
+        src = payload.get("source", "postgresql")
+
+        # chỉ xử lý cho database hiện tại
+        if db != self.pg_config['database']:
+            return
+
+        # tất cả table keys ở hiện tại dùng dạng "schema.table"
+        # payload["table"] có thể là "schema.table" hoặc "table" tùy chỗ. Chuẩn hóa:
+        tbl = payload.get("table")
+        if not tbl:
+            # với RENAME_TABLE payload dùng old_table/new_table
+            tbl = None
+
+        with self.lock:
+            try:
+                if op == "ADD_TABLE":
+                    full_table = payload['table']  # nên là "schema.table"
+                    # tạo schema entry và snapshot rỗng
+                    self.pg_table_schemas.setdefault(full_table, payload.get("columns", {}))
+                    self.pg_table_snapshots.setdefault(full_table, {})
+                    self.pg_table_schema_versions[full_table] = self.pg_table_schema_versions.get(full_table, 0) + 1
+
+                elif op == "DROP_TABLE":
+                    full_table = payload['table']
+                    self.pg_table_schemas.pop(full_table, None)
+                    self.pg_table_snapshots.pop(full_table, None)
+                    self.pg_table_schema_versions.pop(full_table, None)
+
+                elif op == "RENAME_TABLE":
+                    old = payload['old_table']
+                    new = payload['new_table']
+                    # di chuyển schema
+                    if old in self.pg_table_schemas:
+                        self.pg_table_schemas[new] = self.pg_table_schemas.pop(old)
+                    # di chuyển snapshots
+                    if old in self.pg_table_snapshots:
+                        self.pg_table_snapshots[new] = self.pg_table_snapshots.pop(old)
+                    # versions
+                    if old in self.pg_table_schema_versions:
+                        self.pg_table_schema_versions[new] = self.pg_table_schema_versions.pop(old)
+
+                elif op == "ADD_COLUMN":
+                    full_table = payload['table']
+                    col = payload['column']
+                    dtype = payload.get('data_type')
+                    default = payload.get('default', None)
+                    # update schema info
+                    cols = self.pg_table_schemas.setdefault(full_table, {})
+                    cols[col] = dtype
+                    self.pg_table_schema_versions[full_table] = self.pg_table_schema_versions.get(full_table, 0) + 1
+
+                    # update snapshots: thêm key cho mỗi row với default value
+                    snaps = self.pg_table_snapshots.get(full_table, {})
+                    for rid, row in snaps.items():
+                        # nếu default có kiểu PostgreSQL expression, bạn có thể parse/convert ở đây; tạm set default trực tiếp
+                        row[col] = default
+
+                elif op == "DROP_COLUMN":
+                    full_table = payload['table']
+                    col = payload['column']
+                    # update schema
+                    cols = self.pg_table_schemas.get(full_table, {})
+                    if col in cols:
+                        cols.pop(col, None)
+                        self.pg_table_schema_versions[full_table] = self.pg_table_schema_versions.get(full_table, 0) + 1
+                    # update snapshots: remove key
+                    snaps = self.pg_table_snapshots.get(full_table, {})
+                    for rid, row in snaps.items():
+                        if col in row:
+                            row.pop(col, None)
+
+                elif op == "RENAME_COLUMN":
+                    full_table = payload['table']
+                    old_col = payload['old_column']
+                    new_col = payload['new_column']
+                    # schema: rename key and preserve data_type
+                    cols = self.pg_table_schemas.get(full_table, {})
+                    if old_col in cols:
+                        dtype = cols.pop(old_col)
+                        cols[new_col] = dtype
+                        self.pg_table_schema_versions[full_table] = self.pg_table_schema_versions.get(full_table, 0) + 1
+
+                    # snapshots: rename key in each row dict
+                    snaps = self.pg_table_snapshots.get(full_table, {})
+                    for rid, row in snaps.items():
+                        if old_col in row:
+                            row[new_col] = row.pop(old_col)
+                        else:
+                            # nếu row không có old_col, đảm bảo new_col tồn tại (None)
+                            row.setdefault(new_col, None)
+
+                # nếu cần, bạn có thể set một flag để downstream biết schema vừa thay đổi
+                # nhưng vì chúng ta đã cập nhật snapshot, không cần skip poll_rows
+                return
+            except Exception:
+                logger.exception("Error applying DDL to snapshots")
+                return
+
+
+    def _send_ddl_payload(self, payload):
+        topic = f"{self.pg_config['database']}-ddl-topic"
+        try:
+            self.producer.send(topic, value=payload)
+            logger.info(f"PostgreSQL DDL topic: {topic}")
+            logger.info(f"PostgreSQL DDL payload: {payload}")
+        except Exception:
+            logger.exception("Failed to send DDL payload")
+        finally:
+            if payload.get("source") == "postgresql":
+                try:
+                    self._apply_ddl_to_snapshots(payload)
+                except Exception:
+                    logger.exception("Failed to apply DDL to snapshots")
+
+
+
+
     # ---------------- PostgreSQL ----------------
     def connect_postgres(self):
         if not self.enable_postgres:
@@ -266,121 +387,6 @@ class UnifiedKafkaProducer:
                 logger.exception("Error polling PostgreSQL ROWS")
                 time.sleep(5)
 
-    def _apply_ddl_to_snapshots(self, payload):
-        op = payload.get("operation")
-        db = payload.get("database", self.pg_config['database'])
-        src = payload.get("source", "postgresql")
-
-        # chỉ xử lý cho database hiện tại
-        if db != self.pg_config['database']:
-            return
-
-        # tất cả table keys ở hiện tại dùng dạng "schema.table"
-        # payload["table"] có thể là "schema.table" hoặc "table" tùy chỗ. Chuẩn hóa:
-        tbl = payload.get("table")
-        if not tbl:
-            # với RENAME_TABLE payload dùng old_table/new_table
-            tbl = None
-
-        with self.lock:
-            try:
-                if op == "ADD_TABLE":
-                    full_table = payload['table']  # nên là "schema.table"
-                    # tạo schema entry và snapshot rỗng
-                    self.pg_table_schemas.setdefault(full_table, payload.get("columns", {}))
-                    self.pg_table_snapshots.setdefault(full_table, {})
-                    self.pg_table_schema_versions[full_table] = self.pg_table_schema_versions.get(full_table, 0) + 1
-
-                elif op == "DROP_TABLE":
-                    full_table = payload['table']
-                    self.pg_table_schemas.pop(full_table, None)
-                    self.pg_table_snapshots.pop(full_table, None)
-                    self.pg_table_schema_versions.pop(full_table, None)
-
-                elif op == "RENAME_TABLE":
-                    old = payload['old_table']
-                    new = payload['new_table']
-                    # di chuyển schema
-                    if old in self.pg_table_schemas:
-                        self.pg_table_schemas[new] = self.pg_table_schemas.pop(old)
-                    # di chuyển snapshots
-                    if old in self.pg_table_snapshots:
-                        self.pg_table_snapshots[new] = self.pg_table_snapshots.pop(old)
-                    # versions
-                    if old in self.pg_table_schema_versions:
-                        self.pg_table_schema_versions[new] = self.pg_table_schema_versions.pop(old)
-
-                elif op == "ADD_COLUMN":
-                    full_table = payload['table']
-                    col = payload['column']
-                    dtype = payload.get('data_type')
-                    default = payload.get('default', None)
-                    # update schema info
-                    cols = self.pg_table_schemas.setdefault(full_table, {})
-                    cols[col] = dtype
-                    self.pg_table_schema_versions[full_table] = self.pg_table_schema_versions.get(full_table, 0) + 1
-
-                    # update snapshots: thêm key cho mỗi row với default value
-                    snaps = self.pg_table_snapshots.get(full_table, {})
-                    for rid, row in snaps.items():
-                        # nếu default có kiểu PostgreSQL expression, bạn có thể parse/convert ở đây; tạm set default trực tiếp
-                        row[col] = default
-
-                elif op == "DROP_COLUMN":
-                    full_table = payload['table']
-                    col = payload['column']
-                    # update schema
-                    cols = self.pg_table_schemas.get(full_table, {})
-                    if col in cols:
-                        cols.pop(col, None)
-                        self.pg_table_schema_versions[full_table] = self.pg_table_schema_versions.get(full_table, 0) + 1
-                    # update snapshots: remove key
-                    snaps = self.pg_table_snapshots.get(full_table, {})
-                    for rid, row in snaps.items():
-                        if col in row:
-                            row.pop(col, None)
-
-                elif op == "RENAME_COLUMN":
-                    full_table = payload['table']
-                    old_col = payload['old_column']
-                    new_col = payload['new_column']
-                    # schema: rename key and preserve data_type
-                    cols = self.pg_table_schemas.get(full_table, {})
-                    if old_col in cols:
-                        dtype = cols.pop(old_col)
-                        cols[new_col] = dtype
-                        self.pg_table_schema_versions[full_table] = self.pg_table_schema_versions.get(full_table, 0) + 1
-
-                    # snapshots: rename key in each row dict
-                    snaps = self.pg_table_snapshots.get(full_table, {})
-                    for rid, row in snaps.items():
-                        if old_col in row:
-                            row[new_col] = row.pop(old_col)
-                        else:
-                            # nếu row không có old_col, đảm bảo new_col tồn tại (None)
-                            row.setdefault(new_col, None)
-
-                # nếu cần, bạn có thể set một flag để downstream biết schema vừa thay đổi
-                # nhưng vì chúng ta đã cập nhật snapshot, không cần skip poll_rows
-                return
-            except Exception:
-                logger.exception("Error applying DDL to snapshots")
-                return
-
-
-    def _send_ddl_payload(self, payload):
-        topic = f"{self.pg_config['database']}-ddl-topic"
-        try:
-            self.producer.send(topic, value=payload)
-            logger.info(f"PostgreSQL DDL: {payload}")
-        except Exception:
-            logger.exception("Failed to send DDL payload")
-        finally:
-            if payload.get("source") == "postgresql":
-                try:
-                    self._apply_ddl_to_snapshots(payload)
-                except Exception:
-                    logger.exception("Failed to apply DDL to snapshots")
 
 
     def load_pg_schema_state(self):
@@ -780,8 +786,7 @@ class UnifiedKafkaProducer:
                         "columns": current_schema_map[tbl]
                     }
                     topic = f"{self.mssql_config['database']}-ddl-topic"
-                    self.producer.send(topic, value=payload)
-                    logger.info(f"MSSQL DDL: {payload}")
+                    self._send_ddl_payload(payload)
 
                 for tbl in dropped_tables:
                     payload = {
@@ -792,8 +797,7 @@ class UnifiedKafkaProducer:
                         "table": tbl
                     }
                     topic = f"{self.mssql_config['database']}-ddl-topic"
-                    self.producer.send(topic, value=payload)
-                    logger.info(f"MSSQL DDL: {payload}")
+                    self._send_ddl_payload(payload)
 
                 for tbl in old_tables & new_tables:
                     old_cols = self.mssql_table_schemas[tbl]
@@ -817,8 +821,7 @@ class UnifiedKafkaProducer:
                             "data_type": new_cols[c]
                         }
                         topic = f"{self.mssql_config['database']}-ddl-topic"
-                        self.producer.send(topic, value=payload)
-                        logger.info(f"MSSQL DDL: {payload}")
+                        self._send_ddl_payload(payload)
 
                     for c in dropped_cols:
                         payload = {
@@ -830,8 +833,7 @@ class UnifiedKafkaProducer:
                             "column": c
                         }
                         topic = f"{self.mssql_config['database']}-ddl-topic"
-                        self.producer.send(topic, value=payload)
-                        logger.info(f"MSSQL DDL: {payload}")
+                        self._send_ddl_payload(payload)
 
                     for c in modified_cols:
                         payload = {
@@ -845,8 +847,7 @@ class UnifiedKafkaProducer:
                             "new_type": new_cols[c]
                         }
                         topic = f"{self.mssql_config['database']}-ddl-topic"
-                        self.producer.send(topic, value=payload)
-                        logger.info(f"MSSQL DDL: {payload}")
+                        self._send_ddl_payload(payload)
 
                 self.mssql_table_schemas = current_schema_map
                 cursor.close()
