@@ -17,11 +17,9 @@ logger = logging.getLogger(__name__)
 
 class UnifiedKafkaProducer:
     def __init__(self):
-        # ---------------- Kafka ----------------
         self.kafka_servers = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
         self.producer = None
-
-        # ---------------- PostgreSQL ----------------
+        
         self.enable_postgres = os.getenv('ENABLE_POSTGRES', 'true').lower() == 'true'
         self.pg_config = {
             'host': os.getenv('PG_HOST', 'host.docker.internal'),
@@ -37,7 +35,6 @@ class UnifiedKafkaProducer:
         self.pg_table_schema_versions = {}
         self.pg_schema_changed = {}       
 
-        # ---------------- MSSQL ----------------
         self.enable_mssql = os.getenv('ENABLE_MSSQL', 'true').lower() == 'true'
         self.mssql_config = {
             'host': os.getenv('MSSQL_HOST', 'host.docker.internal'),
@@ -56,11 +53,9 @@ class UnifiedKafkaProducer:
 
         self.mssql_poll_interval = int(os.getenv('MSSQL_POLL_INTERVAL', 5))
 
-        # ---------------- General ----------------
         self.message_count = 0
         self.lock = threading.Lock()
 
-    # ---------------- Kafka ----------------
     def connect_kafka(self, max_retries=5):
         if self.producer:
             return
@@ -173,10 +168,6 @@ class UnifiedKafkaProducer:
 
 
     def _send_ddl_payload(self, payload):
-        """
-        Gửi DDL payload lên Kafka và cập nhật snapshot nội bộ.
-        Hỗ trợ cả PostgreSQL và MSSQL.
-        """
         source = payload.get("source", "postgresql").lower()
 
         if source == "postgresql":
@@ -198,7 +189,6 @@ class UnifiedKafkaProducer:
                 logger.exception(f"Failed to apply {source.upper()} DDL to local snapshots")
 
 
-    # ---------------- PostgreSQL ----------------
     def connect_postgres(self):
         if not self.enable_postgres:
             return
@@ -229,7 +219,6 @@ class UnifiedKafkaProducer:
                 topic = f"{self.pg_config['database']}-{table}-topic"
                 logger.info(f"[INITLOAD]: {table_full}")
 
-                # Lấy schema
                 cursor.execute("""
                     SELECT column_name, data_type FROM information_schema.columns
                     WHERE table_schema = %s AND table_name = %s
@@ -241,7 +230,6 @@ class UnifiedKafkaProducer:
                 self.pg_table_schema_versions[table_full] = 0
                 self.pg_schema_changed[table_full] = False
 
-                # Lấy toàn bộ dữ liệu
                 cursor.execute(f'SELECT * FROM "{schema}"."{table}";')
                 columns = [desc[0] for desc in cursor.description]
                 rows = cursor.fetchall()
@@ -264,7 +252,6 @@ class UnifiedKafkaProducer:
                     }
                     self.producer.send(topic, value=payload)
 
-                # Flush sau khi gửi toàn bộ
                 self.producer.flush()
                 logger.info(f"load completed for {table_full} ({total} rows)")
                 all_snapshots[table_full] = snapshot
@@ -273,13 +260,11 @@ class UnifiedKafkaProducer:
             cursor.close()
             return all_snapshots
         except Exception:
-            logger.exception("❌ PostgreSQL initial load error")
+            logger.exception("PostgreSQL initial load error")
             return {}
 
 
-    # ---------------- PostgreSQL Poll - ROW level (insert, update, delete) ----------------
     def postgres_poll_rows(self):
-        """Poll PostgreSQL tables for row-level changes (INSERT/UPDATE/DELETE)."""
         if not self.enable_postgres:
             return
 
@@ -395,7 +380,6 @@ class UnifiedKafkaProducer:
         return schema_state
 
 
-    # ---------------- PostgreSQL Poll - DDL (table/column add, modify, delete) ----------------
     def postgres_poll_ddl(self):
 
         ddl_state = self.load_pg_schema_state()  
@@ -514,8 +498,6 @@ class UnifiedKafkaProducer:
                 time.sleep(5)
 
 
-
-    # ---------------- MSSQL ----------------
     def connect_mssql(self):
         if not self.enable_mssql:
             return
@@ -529,7 +511,6 @@ class UnifiedKafkaProducer:
             login_timeout=self.mssql_config['login_timeout']
         )
     def _open_mssql_conn_with_retry(self, retries=3, backoff=1):
-        """Open a fresh pymssql connection with retry and exponential backoff."""
         attempt = 0
         while attempt < retries:
             try:
@@ -551,7 +532,6 @@ class UnifiedKafkaProducer:
         raise
 
     def mssql_initial_load(self):
-        """Initial load for all MSSQL tables: fill snapshots and schemas"""
         if not self.enable_mssql:
             return {}
 
@@ -574,7 +554,6 @@ class UnifiedKafkaProducer:
                 topic = f"{self.mssql_config['database']}-{table}-topic"
                 logger.info(f"[INITLOAD]: {table_full}")
 
-                # Lấy schema cột
                 cursor.execute("""
                     SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS
                     WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s
@@ -586,7 +565,6 @@ class UnifiedKafkaProducer:
                 self.mssql_table_schema_versions[table_full] = 0
                 self.mssql_schema_changed[table_full] = False
 
-                # Lấy toàn bộ dữ liệu
                 cursor.execute(f"SELECT * FROM [{schema}].[{table}];")
                 rows = cursor.fetchall()
                 total = len(rows)
@@ -609,7 +587,6 @@ class UnifiedKafkaProducer:
                     }
                     self.producer.send(topic, value=payload)
 
-                # Flush sau khi gửi toàn bộ
                 self.producer.flush()
                 logger.info(f"load completed for {table_full} ({total} rows)")
                 all_snapshots[table_full] = snapshot
@@ -619,13 +596,11 @@ class UnifiedKafkaProducer:
             return all_snapshots
 
         except Exception:
-            logger.exception("❌ MSSQL initial load error")
+            logger.exception("MSSQL initial load error")
             return {}
 
         
-        # ---------------- MSSQL Poll - ROW level (insert, update, delete) ----------------
     def mssql_poll_rows(self):
-        """Poll MSSQL tables for row-level changes (INSERT/UPDATE/DELETE)."""
         if not self.enable_mssql:
             return
         
@@ -685,7 +660,6 @@ class UnifiedKafkaProducer:
                             self.message_count += 1
                             logger.info(f"[{op}]: {payload}")
 
-                    # Detect deleted rows
                     deleted_ids = set(last_snapshot.keys()) - set(current_snapshot.keys())
                     for record_id in deleted_ids:
                         payload = {
@@ -747,9 +721,7 @@ class UnifiedKafkaProducer:
         return schema_state
 
 
-
     def mssql_poll_ddl(self):
-        """Phát hiện thay đổi DDL trong MSSQL (giống logic của PostgreSQL DDL polling)."""
         if not self.enable_mssql:
             return
 
@@ -862,7 +834,6 @@ class UnifiedKafkaProducer:
                 time.sleep(5)
 
     
-    # ---------------- Shutdown ----------------
     def shutdown(self):
         try:
             if self.producer:
@@ -881,7 +852,6 @@ class UnifiedKafkaProducer:
         except:
             pass
 
-    # ---------------- Start ----------------
     def start(self):
         try:
             self.connect_kafka()

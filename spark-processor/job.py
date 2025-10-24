@@ -194,7 +194,16 @@ if df_mpass:
     )
 
 
+
 if 'df_mcc_norm' in locals() and 'df_mpass_norm' in locals():
     df_silver = df_mcc_norm.unionByName(df_mpass_norm)
 
-spark.stop()
+    df_silver = df_silver.coalesce(1)
+
+    df_silver.write.mode("overwrite").parquet(silver_path)
+
+    logger.info(f"✅ Lưu dữ liệu Silver thành công: {silver_path}")
+    logger.info(f"📌 Tổng số dòng: {df_silver.count()}")
+else:
+    logger.error("Lỗi")
+

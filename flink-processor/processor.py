@@ -18,25 +18,20 @@ from botocore.exceptions import ClientError
 from collections import defaultdict
 from typing import Callable, Tuple
 
-# =========================
-# Logging configuration
-# =========================
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("IcebergBatchProcessor")
 
-# =========================
-# Processor
-# =========================
+
 class IcebergBatchProcessor:
     def __init__(self):
         self.kafka_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
         self.flink_host = os.getenv("FLINK_JOBMANAGER_HOST", "jobmanager")
         self.flink_port = os.getenv("FLINK_JOBMANAGER_PORT", "8081")
 
-        # MinIO / S3
         self.s3_endpoint = os.getenv("S3_ENDPOINT", "http://minio:9000")
         self.s3_access_key = os.getenv("S3_ACCESS_KEY", "admin")
         self.s3_secret_key = os.getenv("S3_SECRET_KEY", "password123")
@@ -48,6 +43,8 @@ class IcebergBatchProcessor:
 
         self.consumer = None
         self.record_count = 0
+        self.init_done = {} 
+
 
         self.batch_buffer = defaultdict(list)
         self.batch_timestamps = {}
@@ -793,32 +790,45 @@ class IcebergBatchProcessor:
 
                 table_key = f"{database_name}.{table_name}"
 
-                if operation == "INITIAL_LOAD":
-                    flat_record = {**record.get("data", {}), **{
-                    "database": record.get("database"),
-                    "deleted": record.get("deleted"),
-                    "operation": record.get("operation"),
-                    "source": record.get("source"),
-                    "table": record.get("table"),
-                    "timestamp": record.get("timestamp"),
-                }}
+                op_raw = str(record.get("operation", "")).upper()  # giữ nguyên từ Kafka
 
-                self.init_buffer[table_key].append(flat_record)
+                if op_raw == "INITIAL_LOAD":
+                    flat_record = {
+                        **record.get("data", {}),
+                        "database": record.get("database"),
+                        "table": record.get("table"),
+                        "timestamp": record.get("timestamp"),
+                        "deleted": record.get("deleted"),
+                    }
 
-                while len(self.init_buffer[table_key]) >= self.batch_size:
-                    chunk = self.init_buffer[table_key][:self.batch_size]
-                    self.process_init_batches(table_key, chunk)
-                    self.init_buffer[table_key] = self.init_buffer[table_key][self.batch_size:]
+                    self.init_buffer[table_key].append(flat_record)
+                    continue  # KHÔNG transform và KHÔNG xử lý stream
+                            
 
-                def flush_init_buffer(self):
-                    for table_key, records in self.init_buffer.items():
-                        if records:
-                            self.process_init_batches(table_key, records)
+                # chỉ đến đây khi không phải INITLOAD
+                if op_raw in ("INSERT", "UPDATE", "DELETE"):
+
+                    # Chỉ xử lý INITLOAD 1 lần duy nhất
+                    if not self.init_done.get(table_key, False):
+                        buffered = self.init_buffer.get(table_key, [])
+                        if buffered:
+                            total = len(buffered)
+                            logger.info(f"[INITLOAD DONE] {table_key}: total {total}")
+
+                            for i in range(0, total, self.batch_size):
+                                chunk = buffered[i:i+self.batch_size]
+                                self.process_init_batches(table_key, chunk)
+
                             self.init_buffer[table_key] = []
 
+                        self.init_done[table_key] = True
 
-                if operation in ("INSERT", "UPDATE", "DELETE"):
+                    # Bây giờ mới transform để xử lý stream
+                    transformed, table_name, database_name, operation = self.transform_record(record)
                     self.process_stream_record(table_key, transformed)
+
+
+
 
             except Exception as e:
                 logger.exception(f"Processing loop error: {e}")

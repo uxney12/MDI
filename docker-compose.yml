@@ -103,9 +103,6 @@ services:
     networks:
       - data-pipeline
 
-  # ========================================
-  # UNIFIED KAFKA PRODUCER (PostgreSQL + MS SQL)
-  # ========================================
   kafka-producer:
     build:
       context: ./kafka-producer
@@ -114,21 +111,17 @@ services:
       kafka:
         condition: service_healthy
     environment:
-      # Kafka config
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       
-      # Enable/Disable sources
       ENABLE_POSTGRES: "true"
       ENABLE_MSSQL: "true"
       
-      # PostgreSQL config
       PG_HOST: host.docker.internal
       PG_PORT: 5432
       PG_DATABASE: MDI
       PG_USER: postgres
       PG_PASSWORD: 12345
       
-      # MS SQL Server config
       MSSQL_HOST: host.docker.internal
       MSSQL_PORT: 1433
       MSSQL_DATABASE: Mpass
@@ -141,10 +134,6 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
-  # ========================================
-  # ICEBERG BATCH PROCESSOR (Kafka -> Iceberg)
-  # Metadata được tạo theo BATCH, không phải từng record
-  # ========================================
   flink-processor:
     build:
       context: ./flink-processor
@@ -161,33 +150,17 @@ services:
       taskmanager:
         condition: service_started
     environment:
-      # Kafka
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      
-      # Flink
       FLINK_JOBMANAGER_HOST: jobmanager
       FLINK_JOBMANAGER_PORT: 8081
-      
-      # MinIO / S3
       S3_ENDPOINT: http://minio:9000
       S3_ACCESS_KEY: admin
       S3_SECRET_KEY: password123
-      
       LAKEHOUSE_PATH: lakehouse
-      
-      AWS_ACCESS_KEY_ID: admin
-      AWS_SECRET_ACCESS_KEY: password123
-      AWS_REGION: us-east-1
-      AWS_S3_ENDPOINT: http://minio:9000
-    volumes:
-      - flink_data:/data
     restart: unless-stopped
     networks:
       - data-pipeline
 
-  # ========================================
-  # SPARK PROCESSOR (Iceberg Bronze -> Silver)
-  # ========================================
   spark-processor:
     build:
       context: ./spark-processor
