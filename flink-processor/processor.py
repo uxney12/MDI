@@ -59,14 +59,11 @@ class IcebergBatchProcessor:
         self.init_loaded_tables = set()
 
 
-        # Setup S3 Client
         self.s3_client = self.setup_s3_client()
         self.ensure_bucket_exists(self.lakehouse_path)
         self.is_init_mode = True
 
-    # =========================
-    # S3 helpers
-    # =========================
+
     def setup_s3_client(self):
         try:
             s3_client = boto3.client(
@@ -93,9 +90,6 @@ class IcebergBatchProcessor:
             logger.error(f"Bucket error: {e}")
             raise
 
-    # =========================
-    # Paths
-    # =========================
     def get_table_base_path(self, database, table):
         return f"bronze/{database}/{table}"
 
@@ -108,9 +102,7 @@ class IcebergBatchProcessor:
     def get_data_file_key(self, database, table):
         return f"{self.get_data_path(database, table)}/{table}.parquet"
 
-    # =========================
-    # Metadata management (simplified)
-    # =========================
+
     def load_table_metadata(self, database, table):
         table_key = f"{database}.{table}"
         if table_key in self.table_metadata_cache:
@@ -185,9 +177,7 @@ class IcebergBatchProcessor:
         metadata['last-column-id'] = last_column_id
         return schema_id
     
-    # =========================
-    # Helper: normalize db/table names
-    # =========================
+
     def normalize_db_table(self, database: str, table: str) -> Tuple[str,str]:
 
         if table is None:
@@ -206,17 +196,13 @@ class IcebergBatchProcessor:
         self.s3_client.delete_object(Bucket=self.lakehouse_path, Key=temp_key)
         return final_key
 
-    # =========================
-    # Schema management helper
-    # =========================
+
     def df_to_arrow_schema(self, df):
         cols = sorted(df.columns.tolist())
         fields = [(c, pa.string()) for c in cols]
         return pa.schema(fields)
 
-    # =========================
-    # Read existing single data file (returns pyarrow.Table or None)
-    # =========================
+
     def read_existing_table(self, database, table):
         key = self.get_data_file_key(database, table)
         try:
@@ -317,9 +303,7 @@ class IcebergBatchProcessor:
         logger.info(f"Renamed S3 path {prefix_old} → {prefix_new}")
 
 
-    # =========================
-    # Logs: change-log (jsonl) and error-log
-    # =========================
+
     def write_change_log(self, database, table, change_entries):
         ts = int(time.time() * 1000)
         key = f"{self.get_metadata_path(database, table)}/changes-{ts}.jsonl"
@@ -336,9 +320,6 @@ class IcebergBatchProcessor:
         self.s3_client.put_object(Bucket=self.lakehouse_path, Key=key, Body=payload)
         return key
 
-    # =========================
-    # Snapshot & manifest helpers
-    # =========================
     def create_manifest_file(self, database, table, data_file_path, record_count, file_size, operation_summary):
         manifest_id = str(uuid.uuid4())
         manifest_path = f"{self.get_metadata_path(database, table)}/manifest-{manifest_id}.avro"
@@ -405,9 +386,6 @@ class IcebergBatchProcessor:
         metadata['snapshot-log'].append({"snapshot-id": snapshot_id, "timestamp-ms": snapshot_id})
         return snapshot_id
 
-    # =========================
-    # Record helpers
-    # =========================
     def generate_record_id(self, data, table_name, database_name):
         pk_fields = ['stt']
         for field in pk_fields:
@@ -452,9 +430,7 @@ class IcebergBatchProcessor:
             logger.error(f"Transform error: {e}")
             return None, None, None, None
 
-    # =========================
-    # INIT LOAD (batching): used only when no data exists for the table
-    # =========================
+
     def process_init_batches(self, table_key, records):
         """Process records in batches (init). `records` is list of transformed dicts."""
         database, table = table_key.split('.')
@@ -543,11 +519,7 @@ class IcebergBatchProcessor:
         return total_written
 
 
-    # =========================
-    # STREAM per-record processing
-    # - read existing table -> merge single record -> write back
-    # - update metadata + change-log for each record
-    # =========================
+
     def process_stream_record(self, table_key, record):
         database, table = table_key.split('.')
         errors = []
@@ -667,9 +639,7 @@ class IcebergBatchProcessor:
         return errors
     
 
-    # =========================
-    # DDL processing
-    # =========================
+
     def process_ddl_event(self, payload):
         op = payload.get("operation", "").upper()
         raw_db = payload.get("database")
@@ -777,9 +747,6 @@ class IcebergBatchProcessor:
 
 
     
-    # =========================
-    # Kafka consumer
-    # =========================
     def connect_kafka(self):
         try:
             self.consumer = KafkaConsumer(
@@ -795,9 +762,6 @@ class IcebergBatchProcessor:
             logger.error(f"Kafka error: {e}")
             raise
 
-    # =========================
-    # Main processing loop
-    # =========================
     def process(self):
         try:
             self.wait_for_services()
@@ -841,7 +805,6 @@ class IcebergBatchProcessor:
 
                 self.init_buffer[table_key].append(flat_record)
 
-                # xử lý các batch 5-5...
                 while len(self.init_buffer[table_key]) >= self.batch_size:
                     chunk = self.init_buffer[table_key][:self.batch_size]
                     self.process_init_batches(table_key, chunk)

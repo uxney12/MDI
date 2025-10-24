@@ -5,6 +5,8 @@ import re
 from datetime import datetime
 from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.types import *
+from pyspark.sql.types import StringType, IntegerType, DateType, TimestampType
+
 
 
 logging.basicConfig(
@@ -104,8 +106,6 @@ tables = {
 silver_path = "s3a://lakehouse/silver/data/"
 
 for name, path in tables.items():
-    logger.info("=" * 80)
-    logger.info(f"Đang xử lý bảng: {name}")
     try:
         df = spark.read.parquet(path)
         df = filter_deleted_data(df)
@@ -119,8 +119,6 @@ for name, path in tables.items():
         logger.error(traceback.format_exc())
 
 
-from pyspark.sql.types import StringType, IntegerType, DateType, TimestampType
-
 # =======================
 # Chuẩn hóa bảng MCC
 # =======================
@@ -130,11 +128,11 @@ if df_mcc:
         F.col("stt").cast(StringType()).alias("STT"),
         F.lit(None).cast(StringType()).alias("Mã KH"),
         F.lit(None).cast(StringType()).alias("Mã HĐ"),
-        clean_whitespace(F.col("ma_nv")).alias("Mã nhân viên"),
+        clean_code(F.col("ma_nv")).alias("Mã nhân viên"),
         F.lit(None).cast(StringType()).alias("NV quản lý"),
         F.lit(None).cast(StringType()).alias("Mã lái xe"),
         F.lit(None).cast(StringType()).alias("ID cuốc xe"),
-        clean_code(F.col("so_the")).alias("Số thẻ"),
+        F.col("so_the").alias("Số thẻ"),
         clean_whitespace(F.col("ten_in_tren_the")).alias("Tên trên thẻ"),
         clean_whitespace(F.col("san_pham")).alias("Sản phẩm"),
         clean_number(F.col("so_tien")).alias("Số tiền"),
@@ -167,11 +165,11 @@ if df_mpass:
         F.col("stt").cast(IntegerType()).alias("STT"),
         clean_code(F.col("ma_kh")).alias("Mã KH"),
         clean_code(F.col("ma_hd")).alias("Mã HĐ"),
-        clean_whitespace(F.col("nv_quan_ly")).alias("NV quản lý"),
+        clean_code(F.col("nv_quan_ly")).alias("NV quản lý"),
         F.lit(None).cast(StringType()).alias("Mã nhân viên"),
         clean_code(F.col("ma_lai_xe")).alias("Mã lái xe"),
         clean_code(F.col("id_cuoc_xe")).alias("ID cuốc xe"),
-        clean_code(F.col("so_the")).alias("Số thẻ"),
+        F.col("so_the").alias("Số thẻ"),
         clean_whitespace(F.col("ten_in_tren_the")).alias("Tên trên thẻ"),
         clean_whitespace(F.col("san_pham")).alias("Sản phẩm"),
         clean_number(F.col("so_tien")).alias("Số tiền"),
@@ -198,17 +196,5 @@ if df_mpass:
 
 if 'df_mcc_norm' in locals() and 'df_mpass_norm' in locals():
     df_silver = df_mcc_norm.unionByName(df_mpass_norm)
-    logger.info(f"Gộp MCC + MPASS: {df_silver.count()} dòng")
-
-    output_path = silver_path + "mcc_mpass.parquet"
-    (
-        df_silver
-        .coalesce(1)
-        .write
-        .mode("overwrite")
-        .parquet(output_path)
-    )
-
-    logger.info(f"Ghi dữ liệu Silver thành công tại {output_path}")
 
 spark.stop()
