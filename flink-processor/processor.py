@@ -40,11 +40,11 @@ class IcebergBatchProcessor:
         self.s3_endpoint = os.getenv("S3_ENDPOINT", "http://minio:9000")
         self.s3_access_key = os.getenv("S3_ACCESS_KEY", "admin")
         self.s3_secret_key = os.getenv("S3_SECRET_KEY", "password123")
-        self.warehouse_path = os.getenv("WAREHOUSE_PATH", "warehouse")
+        self.lakehouse_path = os.getenv("LAKEHOUSE_PATH", "lakehouse")
 
-        self.batch_size = int(os.getenv("BATCH_SIZE", "500"))
-        self.batch_timeout = int(os.getenv("BATCH_TIMEOUT", "30"))
-        self.init_batch_size = int(os.getenv("INIT_BATCH_SIZE", "1000"))
+        self.batch_size = int(os.getenv("BATCH_SIZE", "5"))
+        self.init_buffer = defaultdict(list)     
+        self.init_timestamps = {}   
 
         self.consumer = None
         self.record_count = 0
@@ -58,16 +58,10 @@ class IcebergBatchProcessor:
         self.table_metadata_cache = {}
         self.init_loaded_tables = set()
 
-        logger.info("=== Iceberg Batch Processor (single file, init-batch + stream-per-record) ===")
-        logger.info(f"Kafka: {self.kafka_servers}")
-        logger.info(f"MinIO: {self.s3_endpoint}")
-        logger.info(f"Warehouse: s3a://{self.warehouse_path}")
-        logger.info(f"Batch Size: {self.batch_size} records")
-        logger.info(f"Init Batch Size: {self.init_batch_size} records")
 
         # Setup S3 Client
         self.s3_client = self.setup_s3_client()
-        self.ensure_bucket_exists(self.warehouse_path)
+        self.ensure_bucket_exists(self.lakehouse_path)
         self.is_init_mode = True
 
     # =========================
@@ -83,29 +77,27 @@ class IcebergBatchProcessor:
                 config=Config(signature_version='s3v4'),
                 region_name=os.getenv('AWS_REGION', 'us-east-1')
             )
-            logger.info("✓ S3 client initialized")
             return s3_client
         except Exception as e:
-            logger.error(f"❌ Failed to initialize S3: {e}")
+            logger.error(f"Failed to initialize S3: {e}")
             raise
 
     def ensure_bucket_exists(self, bucket_name):
         try:
             try:
                 self.s3_client.head_bucket(Bucket=bucket_name)
-                logger.info(f"✓ Bucket '{bucket_name}' exists")
             except ClientError:
                 self.s3_client.create_bucket(Bucket=bucket_name)
-                logger.info(f"✓ Created bucket '{bucket_name}'")
+                logger.info(f"Created bucket '{bucket_name}'")
         except Exception as e:
-            logger.error(f"❌ Bucket error: {e}")
+            logger.error(f"Bucket error: {e}")
             raise
 
     # =========================
     # Paths
     # =========================
     def get_table_base_path(self, database, table):
-        return f"{database}/{table}"
+        return f"bronze/{database}/{table}"
 
     def get_metadata_path(self, database, table):
         return f"{self.get_table_base_path(database, table)}/metadata"
@@ -126,10 +118,10 @@ class IcebergBatchProcessor:
 
         version_hint_path = f"{self.get_metadata_path(database, table)}/version-hint.text"
         try:
-            response = self.s3_client.get_object(Bucket=self.warehouse_path, Key=version_hint_path)
+            response = self.s3_client.get_object(Bucket=self.lakehouse_path, Key=version_hint_path)
             current_version = int(response['Body'].read().decode('utf-8').strip())
             metadata_file_path = f"{self.get_metadata_path(database, table)}/v{current_version}.metadata.json"
-            response = self.s3_client.get_object(Bucket=self.warehouse_path, Key=metadata_file_path)
+            response = self.s3_client.get_object(Bucket=self.lakehouse_path, Key=metadata_file_path)
             metadata = json.loads(response['Body'].read().decode('utf-8'))
             self.table_metadata_cache[table_key] = metadata
             return metadata
@@ -148,7 +140,7 @@ class IcebergBatchProcessor:
         metadata = {
             "format-version": 2,
             "table-uuid": table_uuid,
-            "location": f"s3a://{self.warehouse_path}/{self.get_table_base_path(database, table)}",
+            "location": f"s3a://{self.lakehouse_path}/{self.get_table_base_path(database, table)}",
             "last-updated-ms": int(datetime.now().timestamp() * 1000),
             "last-column-id": 0,
             "schemas": [],
@@ -175,10 +167,10 @@ class IcebergBatchProcessor:
             "timestamp-ms": metadata['last-updated-ms']
         })
         metadata_file_path = f"{self.get_metadata_path(database, table)}/v{new_version}.metadata.json"
-        self.s3_client.put_object(Bucket=self.warehouse_path, Key=metadata_file_path, Body=json.dumps(metadata, indent=2).encode('utf-8'))
+        self.s3_client.put_object(Bucket=self.lakehouse_path, Key=metadata_file_path, Body=json.dumps(metadata, indent=2).encode('utf-8'))
         version_hint_path = f"{self.get_metadata_path(database, table)}/version-hint.text"
-        self.s3_client.put_object(Bucket=self.warehouse_path, Key=version_hint_path, Body=str(new_version).encode('utf-8'))
-        logger.info(f"✓ Saved metadata v{new_version} for {database}.{table}")
+        self.s3_client.put_object(Bucket=self.lakehouse_path, Key=version_hint_path, Body=str(new_version).encode('utf-8'))
+        logger.info(f"metadata v{new_version} for {database}.{table}")
         self.table_metadata_cache[f"{database}.{table}"] = metadata
 
     def add_schema_to_metadata(self, metadata, arrow_schema):
@@ -208,10 +200,10 @@ class IcebergBatchProcessor:
     def atomic_write_data_file(self, database, table, bytes_data):
         final_key = self.get_data_file_key(database, table)
         temp_key = f"{self.get_data_path(database, table)}/._tmp_{uuid.uuid4().hex}.parquet"
-        self.s3_client.put_object(Bucket=self.warehouse_path, Key=temp_key, Body=bytes_data)
-        copy_source = {'Bucket': self.warehouse_path, 'Key': temp_key}
-        self.s3_client.copy_object(Bucket=self.warehouse_path, CopySource=copy_source, Key=final_key)
-        self.s3_client.delete_object(Bucket=self.warehouse_path, Key=temp_key)
+        self.s3_client.put_object(Bucket=self.lakehouse_path, Key=temp_key, Body=bytes_data)
+        copy_source = {'Bucket': self.lakehouse_path, 'Key': temp_key}
+        self.s3_client.copy_object(Bucket=self.lakehouse_path, CopySource=copy_source, Key=final_key)
+        self.s3_client.delete_object(Bucket=self.lakehouse_path, Key=temp_key)
         return final_key
 
     # =========================
@@ -228,7 +220,7 @@ class IcebergBatchProcessor:
     def read_existing_table(self, database, table):
         key = self.get_data_file_key(database, table)
         try:
-            resp = self.s3_client.get_object(Bucket=self.warehouse_path, Key=key)
+            resp = self.s3_client.get_object(Bucket=self.lakehouse_path, Key=key)
             import io
             data = resp['Body'].read()
             buf = io.BytesIO(data)
@@ -249,7 +241,7 @@ class IcebergBatchProcessor:
 
             file_size = 0
             try:
-                resp = self.s3_client.head_object(Bucket=self.warehouse_path, Key=data_key)
+                resp = self.s3_client.head_object(Bucket=self.lakehouse_path, Key=data_key)
                 file_size = int(resp.get('ContentLength', 0))
             except Exception:
                 file_size = operation_summary.get('file_size', 0)
@@ -262,7 +254,6 @@ class IcebergBatchProcessor:
 
             self.save_metadata(database, table, metadata)
 
-            logger.info(f"✓ Committed snapshot {snapshot_id} for {database}.{table} (change_type={change_type})")
             return {
                 "change_log": change_log_path,
                 "manifest": manifest_path,
@@ -317,13 +308,13 @@ class IcebergBatchProcessor:
     def _rename_table_in_s3(self, database, old_table, new_table):
         prefix_old = f"{database}/{old_table}/"
         prefix_new = f"{database}/{new_table}/"
-        response = self.s3_client.list_objects_v2(Bucket=self.warehouse_path, Prefix=prefix_old)
+        response = self.s3_client.list_objects_v2(Bucket=self.lakehouse_path, Prefix=prefix_old)
         for obj in response.get("Contents", []):
             old_key = obj["Key"]
             new_key = old_key.replace(prefix_old, prefix_new, 1)
-            self.s3_client.copy_object(Bucket=self.warehouse_path, CopySource={"Bucket": self.warehouse_path, "Key": old_key}, Key=new_key)
-            self.s3_client.delete_object(Bucket=self.warehouse_path, Key=old_key)
-        logger.info(f"✓ Renamed S3 path {prefix_old} → {prefix_new}")
+            self.s3_client.copy_object(Bucket=self.lakehouse_path, CopySource={"Bucket": self.lakehouse_path, "Key": old_key}, Key=new_key)
+            self.s3_client.delete_object(Bucket=self.lakehouse_path, Key=old_key)
+        logger.info(f"Renamed S3 path {prefix_old} → {prefix_new}")
 
 
     # =========================
@@ -333,7 +324,7 @@ class IcebergBatchProcessor:
         ts = int(time.time() * 1000)
         key = f"{self.get_metadata_path(database, table)}/changes-{ts}.jsonl"
         payload = "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in change_entries)
-        self.s3_client.put_object(Bucket=self.warehouse_path, Key=key, Body=payload)
+        self.s3_client.put_object(Bucket=self.lakehouse_path, Key=key, Body=payload)
         return key
 
     def write_error_log(self, database, table, error_entries):
@@ -342,7 +333,7 @@ class IcebergBatchProcessor:
         ts = int(time.time() * 1000)
         key = f"{self.get_metadata_path(database, table)}/errors-{ts}.jsonl"
         payload = "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in error_entries)
-        self.s3_client.put_object(Bucket=self.warehouse_path, Key=key, Body=payload)
+        self.s3_client.put_object(Bucket=self.lakehouse_path, Key=key, Body=payload)
         return key
 
     # =========================
@@ -364,7 +355,7 @@ class IcebergBatchProcessor:
             }
         }
         content = json.dumps([manifest_entry], indent=2)
-        self.s3_client.put_object(Bucket=self.warehouse_path, Key=manifest_path, Body=content.encode('utf-8'))
+        self.s3_client.put_object(Bucket=self.lakehouse_path, Key=manifest_path, Body=content.encode('utf-8'))
         return manifest_path
 
     def create_manifest_list(self, database, table, manifest_files, total_records):
@@ -385,7 +376,7 @@ class IcebergBatchProcessor:
                 "deleted_rows_count": 0
             })
         content = json.dumps(manifest_list, indent=2)
-        self.s3_client.put_object(Bucket=self.warehouse_path, Key=manifest_list_path, Body=content.encode('utf-8'))
+        self.s3_client.put_object(Bucket=self.lakehouse_path, Key=manifest_list_path, Body=content.encode('utf-8'))
         return manifest_list_path
 
     def create_snapshot(self, metadata, manifest_list_path, operation_summary, change_log_path=None, change_type='stream'):
@@ -471,11 +462,14 @@ class IcebergBatchProcessor:
         change_logs = []
         total_written = 0
 
-        for i in range(0, len(records), self.batch_size):
+        total_records = len(records)
+        logger.info(f"[INITLOAD] {table_key}: total {total_records} records")
+
+        for i in range(0, total_records, self.batch_size):
             chunk = records[i:i + self.batch_size]
+
             try:
                 df_chunk = pd.DataFrame(chunk).astype(str)
-
                 if 'deleted' not in df_chunk.columns:
                     df_chunk['deleted'] = False
 
@@ -493,44 +487,28 @@ class IcebergBatchProcessor:
                     df_combined = df_chunk
 
                 arrow_schema = self.df_to_arrow_schema(df_combined)
-                schema_changed = False
                 metadata = self.load_table_metadata(database, table)
-                if metadata['current-schema-id'] == -1 or metadata.get('schemas') == []:
+
+                if metadata['current-schema-id'] == -1 or not metadata.get('schemas'):
                     self.add_schema_to_metadata(metadata, arrow_schema)
-                    schema_changed = True
 
-                import io
-
-                for col in ['deleted']:
-                    if col in df_combined.columns:
-                        if col in arrow_schema.names:
-                            field_type = arrow_schema.field(col).type
-                            if pa.types.is_string(field_type):
-                                df_combined[col] = df_combined[col].astype(str)
-                            elif pa.types.is_boolean(field_type):
-                                df_combined[col] = df_combined[col].astype(bool)
-                        else:
-                            df_combined[col] = df_combined[col].astype(bool)
-
-                arrow_table = pa.Table.from_pandas(df_combined, schema=arrow_schema)
                 buf = io.BytesIO()
+                arrow_table = pa.Table.from_pandas(df_combined, schema=arrow_schema)
                 pq.write_table(arrow_table, buf, compression='snappy')
                 buf.seek(0)
                 bytes_data = buf.getvalue()
                 data_key = self.atomic_write_data_file(database, table, bytes_data)
                 file_size = len(bytes_data)
 
-                batch_duration = 0 
-                op_counts = {'INSERT': len(df_chunk), 'UPDATE': 0, 'DELETE': 0}
                 op_summary = {
                     'batch_size': len(df_chunk),
-                    'inserts': op_counts['INSERT'],
+                    'inserts': len(df_chunk),
                     'updates': 0,
                     'deletes': 0,
                     'total_records': len(df_combined),
                     'file_size': file_size,
                     'primary_operation': 'batch',
-                    'duration_ms': batch_duration
+                    'duration_ms': 0
                 }
 
                 for r in chunk:
@@ -545,6 +523,7 @@ class IcebergBatchProcessor:
                 change_log_path = self.write_change_log(database, table, change_logs)
                 manifest_path = self.create_manifest_file(database, table, data_key, len(df_combined), file_size, op_summary)
                 manifest_list_path = self.create_manifest_list(database, table, [manifest_path], len(df_combined))
+
                 self.create_snapshot(metadata, manifest_list_path, op_summary, change_log_path=change_log_path, change_type='batch')
                 self.save_metadata(database, table, metadata)
 
@@ -560,7 +539,9 @@ class IcebergBatchProcessor:
 
         if errors:
             self.write_error_log(database, table, errors)
+
         return total_written
+
 
     # =========================
     # STREAM per-record processing
@@ -676,7 +657,7 @@ class IcebergBatchProcessor:
             self.create_snapshot(metadata, manifest_list_path, op_summary, change_log_path=change_log_path, change_type=change_type)
             self.save_metadata(database, table, metadata)
 
-            logger.info(f"Processed stream op={op} for {table_key} rec={rec_id} (schema_changed={schema_changed})")
+            logger.info(f"[{op}] {table_key} {rec_id} (schema_changed={schema_changed})")
 
         except Exception as e:
             err = {"table": table_key, "record_id": record.get('_record_id'), "error": str(e), "time": datetime.now().isoformat()}
@@ -694,7 +675,7 @@ class IcebergBatchProcessor:
         raw_db = payload.get("database")
         raw_table = payload.get("table")
         db, table = self.normalize_db_table(raw_db, raw_table)
-        logger.info(f"Processing DDL event: {op} on {raw_db}.{raw_table} -> normalized as {db}.{table}")
+        logger.info(f"[DDL]{op} {raw_db}.{raw_table}")
 
         if not db:
             logger.warning("DDL payload missing database")
@@ -709,7 +690,7 @@ class IcebergBatchProcessor:
             metadata = self.create_new_table_metadata(db, table)
             self.add_schema_to_metadata(metadata, arrow_schema)
             self.save_metadata(db, table, metadata)
-            logger.info(f"✓ Created empty table {db}.{table}")
+            logger.info(f"Created {db}.{table}")
             return
 
         if op == "DROP_TABLE":
@@ -748,14 +729,14 @@ class IcebergBatchProcessor:
                 if 'deleted' not in df.columns:
                     df['deleted'] = False
                 self._write_back_table_with_schema(db, table, df)
-                logger.info(f"✓ Added column {col} (default={default}) to newly created {db}.{table}")
+                logger.info(f"Added column {col} (default={default}) to newly created {db}.{table}")
                 return
 
             df = existing_table.to_pandas().astype(str)
             if col not in df.columns:
                 df[col] = default if default is not None else ''
             self._write_back_table_with_schema(db, table, df)
-            logger.info(f"✓ Added column {col} (default={default}) to {db}.{table}")
+            logger.info(f"Added column {col} (default={default}) to {db}.{table}")
             return
 
         if op == "RENAME_COLUMN":
@@ -772,7 +753,7 @@ class IcebergBatchProcessor:
             if old_col in df.columns:
                 df.rename(columns={old_col: new_col}, inplace=True)
                 self._write_back_table_with_schema(db, table, df)
-                logger.info(f"✓ Renamed column {old_col} → {new_col} in {db}.{table}")
+                logger.info(f"Renamed column {old_col} → {new_col} in {db}.{table}")
             return
 
         if op == "DROP_COLUMN":
@@ -789,10 +770,10 @@ class IcebergBatchProcessor:
                 new_col = f"{col}_deleted"
                 df.rename(columns={col: new_col}, inplace=True)
                 self._write_back_table_with_schema(db, table, df)
-                logger.info(f"✓ Renamed column {col} → {new_col} (DROP_COLUMN) in {db}.{table}")
+                logger.info(f"Renamed column {col} → {new_col} (DROP_COLUMN) in {db}.{table}")
             return
 
-        logger.info(f"✅ Finished DDL: {op} on {db}.{table}")
+        logger.info(f"DDL: {op} {db}.{table}")
 
 
     
@@ -809,7 +790,7 @@ class IcebergBatchProcessor:
                 group_id="iceberg-batch-processor-group"
             )
             self.consumer.subscribe(pattern=".*")  
-            logger.info("✓ Connected to Kafka, subscribed to all topics")
+            logger.info("Connected to Kafka, subscribed to all topics")
         except KafkaError as e:
             logger.error(f"Kafka error: {e}")
             raise
@@ -824,9 +805,8 @@ class IcebergBatchProcessor:
             logger.warning("Service wait failed or skipped")
 
         self.connect_kafka()
-        logger.info("🚀 Processor started (init-batch + stream-per-record)")
+        logger.info("Processor started (init-batch + stream-per-record)")
 
-        init_buffers = defaultdict(list)
         
         for message in self.consumer:
             try:
@@ -849,19 +829,30 @@ class IcebergBatchProcessor:
 
                 table_key = f"{database_name}.{table_name}"
 
-                if table_key not in self.init_loaded_tables:
-                    if self.read_existing_table(database_name, table_name) is not None:
-                        self.init_loaded_tables.add(table_key)
-                        logger.info(f"Detected existing data for {table_key}, switching to stream mode")
-                    else:
-                        init_buffers[table_key].append(transformed)
-                        logger.info(f"[{self.record_count}] Buffered for INIT: {table_key} | {len(init_buffers[table_key])} records")
+                if operation == "INITIAL_LOAD":
+                    flat_record = {**record.get("data", {}), **{
+                    "database": record.get("database"),
+                    "deleted": record.get("deleted"),
+                    "operation": record.get("operation"),
+                    "source": record.get("source"),
+                    "table": record.get("table"),
+                    "timestamp": record.get("timestamp"),
+                }}
 
-                        if len(init_buffers[table_key]) >= self.init_batch_size:
-                            total = self.process_init_batches(table_key, init_buffers[table_key])
-                            logger.info(f"Init load completed chunk for {table_key} -> {total} records written")
-                            init_buffers[table_key] = []
-                        continue  
+                self.init_buffer[table_key].append(flat_record)
+
+                # xử lý các batch 5-5...
+                while len(self.init_buffer[table_key]) >= self.batch_size:
+                    chunk = self.init_buffer[table_key][:self.batch_size]
+                    self.process_init_batches(table_key, chunk)
+                    self.init_buffer[table_key] = self.init_buffer[table_key][self.batch_size:]
+
+                def flush_init_buffer(self):
+                    for table_key, records in self.init_buffer.items():
+                        if records:
+                            self.process_init_batches(table_key, records)
+                            self.init_buffer[table_key] = []
+
 
                 if operation in ("INSERT", "UPDATE", "DELETE"):
                     self.process_stream_record(table_key, transformed)
@@ -879,20 +870,17 @@ class IcebergBatchProcessor:
                 try:
                     s = socket.create_connection((host, int(port)), timeout=2)
                     s.close()
-                    logger.info("✓ Kafka ready")
                     break
                 except Exception:
                     time.sleep(1)
         except Exception:
             logger.debug("Skipping Kafka wait")
 
-        logger.info("Waiting for Flink JobManager... (best-effort)")
         try:
             for _ in range(5):
                 try:
                     r = requests.get(f"http://{self.flink_host}:{self.flink_port}/overview", timeout=2)
                     if r.status_code == 200:
-                        logger.info("✓ Flink ready")
                         return
                 except:
                     time.sleep(1)
